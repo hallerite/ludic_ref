@@ -183,18 +183,11 @@ class Orchestrator:
         """
         Synchronous wrapper around `generate()`.
 
-        - If already inside an event loop (e.g. notebook), uses nest_asyncio.
-        - Otherwise, uses asyncio.run.
+        Intended for scripts/CLIs without an existing event loop.
+        If you're in a notebook or async app, call `await generate()` instead.
         """
-        try:
-            loop = asyncio.get_running_loop()
-            # If already in an event loop (e.g., notebook), enable nested run
-            import nest_asyncio  # type: ignore[import]
+        return asyncio.run(self.generate())
 
-            nest_asyncio.apply()
-            return loop.run_until_complete(self.generate())  # type: ignore[return-value]
-        except RuntimeError:
-            return asyncio.run(self.generate())
 
     # ---- SAW batch generation --------------------------------------------
 
