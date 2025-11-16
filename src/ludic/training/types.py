@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 from ludic.env import Env
@@ -78,6 +78,16 @@ class SAWItem:
     weight: float
     meta: Dict[str, JSON]
 
+@dataclass
+class SAWBatch:
+    """
+    Logical batch of State–Action–Weight samples.
+
+    - items: the SAWItem samples
+    - meta: batch-level metadata (reward stats, timing, env info, etc.)
+    """
+    items: list[SAWItem]
+    meta: dict[str, JSON] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 # Helper aliases

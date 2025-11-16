@@ -23,11 +23,11 @@ from ludic.training.types import (
     RolloutPolicy,
     WeightingStrategy,
     SAWItem,
+    SAWBatch,
     RolloutStepKey,
     TokenizeFn,
     StateFromStepFn,
 )
-
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +53,7 @@ class OrchestratorConfig:
     timeout_s: Optional[float] = None
     system_prompt: Optional[str] = None
     jsonl_path: Optional[str] = None  # if set, append each rollout as JSONL
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator
@@ -188,7 +189,6 @@ class Orchestrator:
         """
         return asyncio.run(self.generate())
 
-
     # ---- SAW batch generation --------------------------------------------
 
     async def generate_batch(
@@ -199,34 +199,35 @@ class Orchestrator:
         state_from_step: Optional[StateFromStepFn] = None,
         use_model_token_ids: bool = True,
         retokenize: bool = False,
-    ) -> List[SAWItem]:
+    ) -> SAWBatch:
         """
         High-level entrypoint for RL-style training:
 
         - runs episodes (via `generate`)
         - computes weights per (rollout, step) via WeightingStrategy
-        - builds State–Action–Weight items, including:
+        - builds a State–Action–Weight batch, including:
             * tokenized input_ids (state + action)
             * attention_mask
             * action_mask (1 on action tokens, 0 elsewhere)
-            * scalar weight
+            * scalar weight per item
+            * batch-level metadata (in SAWBatch.meta)
 
         Tokenization strategy:
 
         - If `use_model_token_ids=True`, this looks for stored model token IDs:
                 step.info["prompt_token_ids"]
                 step.info["token_ids"]      # TODO: naming inconsistent; fix later
-            These must be populated by the Agent or run_episode.  
-            If present, they are always used.
+          These must be populated by the Agent or run_episode.
+          If present, they are always used.
 
         - If model token IDs are missing:
 
                 * If `retokenize=True`, we fall back to the provided `tokenize(text)`
-                function for both state and action.
+                  function for both state and action.
 
-                * If `retokenize=False`, we raise an error.  
-                This avoids silent misalignment between model tokenization and
-                post-hoc text tokenization.
+                * If `retokenize=False`, we raise an error.
+                  This avoids silent misalignment between model tokenization and
+                  post-hoc text tokenization.
 
         `state_from_step` default:
         - If not provided, the “state” is the observation before the action:
@@ -334,4 +335,15 @@ class Orchestrator:
                     )
                 )
 
-        return items
+        # ---- Build batch-level metadata -----------------------------------
+        # TODO: Add more metrics for logging
+        meta = {
+            "episodes": len(rollouts),
+            "total_items": len(items),
+            "avg_total_reward": (
+                float(sum(r.total_reward for r in rollouts) / len(rollouts))
+                if rollouts else 0.0
+            ),
+        }
+
+        return SAWBatch(items=items, meta=meta)
