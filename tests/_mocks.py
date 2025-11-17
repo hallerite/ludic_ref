@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+import torch
+
 from typing import Any, Optional, List, Tuple, Mapping, Dict
 
 from ludic.types import Message, StepOutcome, Observation, Info
@@ -22,7 +25,7 @@ class MockClient:
     ) -> tuple[ChatResponse, Dict[str, Any]]:
         return ChatResponse(text=self._text), {"used_args": sampling}
 
-    def push_update_atomic(self, params: Mapping[str, "torch.Tensor"], **kwargs) -> str:  # type: ignore[name-defined]
+    def push_update_atomic(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:  # type: ignore[name-defined]
         return "mock-version"
 
 class MockAgent(Agent):

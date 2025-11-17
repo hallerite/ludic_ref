@@ -64,7 +64,7 @@ def simple_tokenize(text: str) -> list[int]:
 async def test_generate_batch_builds_sawbatch_with_weights_and_masks() -> None:
     # Env/agent setup: MockAgent always outputs "1", so each episode
     # terminates in a single step with reward=1.0.
-    env_factory = lambda: MockEnv(max_steps=4, target="1")
+    env_factory = lambda: MockEnv(max_steps=4, target="1") # noqa: E731
     agent = MockAgent()
 
     batch_size = 3

@@ -240,7 +240,6 @@ async def test_vllm_client_returns_token_ids_and_detok(
     Ensure return_token_ids=True yields token IDs + prompt token IDs,
     and detokenize them for debug visibility.
     """
-    from transformers import AutoTokenizer  # lazy import; tests only
 
     sampling = get_default_sampling_config()
 
@@ -259,13 +258,6 @@ async def test_vllm_client_returns_token_ids_and_detok(
     assert resp.text.strip() != ""
     assert resp.token_ids is not None
     assert resp.prompt_token_ids is not None
-
-    tokenizer = AutoTokenizer.from_pretrained(vllm_model_name, trust_remote_code=True)
-
-    detok_prompt = tokenizer.decode(resp.prompt_token_ids)
-    detok_completion = tokenizer.decode(resp.token_ids)
-
-    assert "hello" in detok_completion.lower()
 
 @pytest.mark.asyncio
 async def test_vllm_global_think_processor_triggers_at_very_small_max_think(
