@@ -8,7 +8,7 @@ import pytest
 from ludic.agent import Agent
 from ludic.inference.client import ChatResponse
 from ludic.inference.sampling import SamplingConfig
-from ludic.training.rollout_egine import (
+from ludic.training.rollout_engine import (
     RolloutEngine,
     RolloutBatchSource,
 )
