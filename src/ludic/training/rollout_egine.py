@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -14,7 +13,7 @@ from ludic.interaction import run_episode
 from ludic.types import Rollout, SamplingArgs
 
 from ludic.training.types import (
-    CreditAssigner,   # TODO: change name to credit assign something
+    CreditAssigner,
     SAWItem,
     SAWBatch,
     RolloutStepKey,
@@ -35,9 +34,9 @@ EnvRegistry = Dict[str, EnvFactory]
 CtxRegistry = Dict[str, CtxFactory]
 
 
-class Orchestrator:
+class RolloutEngine:
     """
-    Dumb, stateless orchestrator:
+    Dumb, stateless rollout engine:
 
       - given a list of RolloutRequests
       - spawns Env / Context instances via registries
@@ -54,7 +53,7 @@ class Orchestrator:
 
     Higher-level policies (curriculum, branching from snapshots, replay, etc.)
     should live in a BatchSource-like abstraction that decides which
-    RolloutRequests to send here. Orchestrator stays a dumb executor.
+    RolloutRequests to run. The RolloutEngine stays a dumb executor.
     """
 
     def __init__(
@@ -78,9 +77,7 @@ class Orchestrator:
     # ---- registry helpers ------------------------------------------------
 
     def _build_env(self, spec: EnvSpec) -> Env:
-        """
-        Instantiate an Env from an EnvSpec via the env_registry.
-        """
+        """Instantiate an Env from an EnvSpec via the env_registry."""
         try:
             factory = self.env_registry[spec.kind]
         except KeyError as exc:
@@ -88,9 +85,7 @@ class Orchestrator:
         return factory(**spec.kwargs)
 
     def _build_ctx(self, spec: CtxSpec) -> ContextStrategy:
-        """
-        Instantiate a ContextStrategy from a CtxSpec via the ctx_registry.
-        """
+        """Instantiate a ContextStrategy from a CtxSpec via the ctx_registry."""
         try:
             factory = self.ctx_registry[spec.kind]
         except KeyError as exc:
@@ -128,12 +123,11 @@ class Orchestrator:
                 timeout_s=timeout_s,
             )
 
-            # basic metadata; purely for logging / debugging
             rollout.meta.setdefault("episode_idx", episode_idx)
             rollout.meta.setdefault("request_meta", {})
             rollout.meta["request_meta"].update(request.meta)
-            rollout.meta.setdefault("orchestrator", {})
-            rollout.meta["orchestrator"].update(
+            rollout.meta.setdefault("engine", {})
+            rollout.meta["engine"].update(
                 {
                     "max_steps": max_steps,
                     "timeout_s": timeout_s,
@@ -187,16 +181,7 @@ class Orchestrator:
         Run all rollouts described by `requests` and return them.
 
         Each RolloutRequest may specify a different env / ctx / sampling config
-        and a different num_episodes, so heterogeneous batches are supported.
-
-        Example (conceptual):
-
-            requests = [
-                RolloutRequest(env=EnvSpec("env_a", {...}), num_episodes=8, ...),
-                RolloutRequest(env=EnvSpec("env_b", {...}), num_episodes=2, ...),
-            ]
-
-        will launch 10 episodes total: 8 of env_a and 2 of env_b.
+        and a different num_episodes, supporting heterogeneous batches.
         """
         if not requests:
             return []
@@ -238,37 +223,19 @@ class Orchestrator:
         """
         High-level entrypoint for RL-style training:
 
-        - runs all requested rollouts (via `generate_rollouts`)
-        - computes weights per (rollout, step) via CreditAssigner
-        - builds a State–Action–Weight batch, including:
-            * tokenized input_ids (state + action)
-            * attention_mask
-            * action_mask (1 on action tokens, 0 elsewhere)
-            * scalar weight per item
-            * batch-level metadata (in SAWBatch.meta)
+        - runs all requested rollouts
+        - computes weights via CreditAssigner
+        - builds a State–Action–Weight batch
 
         Tokenization strategy:
-
-        - First, we always look for stored model token IDs:
-                step.info["prompt_token_ids"]
-                step.info["completion_token_ids"] or step.info["token_ids"]
-          These must be populated by the Agent or run_episode.
-          If present and well-typed, they are always used.
-
-        - If model token IDs are missing:
-
-                * If `retokenize=True`, we fall back to the provided `tokenize(text)`
-                  function for both state and action.
-
-                * If `retokenize=False`, we raise an error to avoid silent
-                  mismatch between model vs. post-hoc tokenization.
-
-          Custom implementations can build state text from the full rollout,
-          step.info, or anything else (e.g. truncated dialog context).
+        - If Step.info contains `prompt_token_ids` and `completion_token_ids`,
+          those are used.
+        - Otherwise, if retokenize=True, use provided tokenizer.
+        - Else raise an error.
         """
         assert (not retokenize) or tokenize, (
             "Either use a chat client that populates token IDs, "
-            "or pass a tokenizer if you enable retokenize=True."
+            "or pass a tokenizer if retokenize=True."
         )
 
         rollouts = await self.generate_rollouts(
@@ -282,10 +249,9 @@ class Orchestrator:
         items: List[SAWItem] = []
 
         for r in rollouts:
-            for i, step in enumerate(r.steps):
+            for step in r.steps:
                 key: RolloutStepKey = (r.id, step.index)
 
-                # ---- every step must have an explicit weight ----
                 try:
                     w_raw = weights[key]
                 except KeyError as exc:
@@ -298,9 +264,7 @@ class Orchestrator:
                 w = float(w_raw)
                 info = step.info or {}
 
-                # Try model token IDs
                 prompt_ids = info.get("prompt_token_ids")
-                # TODO: naming here is inconsistent; "token_ids" are the completion ids.
                 completion_ids = info.get("completion_token_ids") or info.get("token_ids")
 
                 has_model_ids = (
@@ -311,7 +275,6 @@ class Orchestrator:
                 )
 
                 if has_model_ids:
-                    # Path A: model token IDs
                     input_ids = list(prompt_ids) + list(completion_ids)
                     attention_mask = [1] * len(input_ids)
                     action_mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
@@ -333,7 +296,6 @@ class Orchestrator:
                     )
                     continue
 
-                # --- Missing model IDs ---
                 if not retokenize:
                     raise ValueError(
                         f"Missing model token IDs for rollout {r.id}, step {step.index}, "
@@ -342,7 +304,7 @@ class Orchestrator:
                         "'completion_token_ids' / 'token_ids' in Step.info."
                     )
 
-                # Path B: retokenize using text
+                # Retokenize path
                 state_text = step.prev_obs
                 action_text = step.action
 
@@ -384,31 +346,29 @@ class Orchestrator:
 
 
 # ---------------------------------------------------------------------------
-# Default BatchSource: on-policy rollouts via Orchestrator
+# Default BatchSource: on-policy rollouts via RolloutEngine
 # ---------------------------------------------------------------------------
 
 
 class RolloutBatchSource:
     """
-    Default BatchSource that uses an Orchestrator to generate on-policy
+    Default BatchSource that uses a RolloutEngine to generate on-policy
     rollouts each time `next_batch()` is called.
 
-    - It delegates to Orchestrator.generate_batch(...) with fixed config.
+    - Delegates entirely to RolloutEngine.generate_batch(...)
     - For exotic behaviors (branching from snapshots, curricula, replay),
-      write your own BatchSource implementation instead of hacking Trainer.
+      write your own BatchSource instead of modifying Trainer.
 
-    This class is intentionally just a thin "policy" over:
+    This class is intentionally a thin "policy" over:
 
         - which RolloutRequests to run this step
         - and how to configure max_steps / timeouts / tokenization
-
-    so that Trainer never needs to know about envs, contexts, or requests.
     """
 
     def __init__(
         self,
         *,
-        orchestrator: Orchestrator,
+        orchestrator: RolloutEngine,
         credit_assigner: CreditAssigner,
         requests_fn: Callable[[], List[RolloutRequest]],
         max_steps: int,
@@ -417,30 +377,12 @@ class RolloutBatchSource:
         retokenize: bool = False,
         tokenize: Optional[TokenizeFn] = None,
     ) -> None:
-        """
-        Args:
-            orchestrator:
-                Orchestrator that knows how to execute RolloutRequests.
-
-            credit_assigner:
-                Credit assignment strategy (e.g. MonteCarloReturn).
-
-            requests_fn:
-                Callable that returns a fresh list of RolloutRequest objects
-                for each batch. This is where you put curriculum / heterogeneity.
-
-            max_steps, timeout_s, concurrency:
-                Passed through to Orchestrator.generate_batch(...).
-
-            retokenize, tokenize:
-                Tokenization behavior knobs, also passed through.
-        """
         if retokenize and tokenize is None:
             raise ValueError(
                 "RolloutBatchSource: retokenize=True requires a tokenize() function."
             )
 
-        self._orchestrator = orchestrator
+        self._engine = orchestrator
         self._credit_assigner = credit_assigner
         self._requests_fn = requests_fn
         self._max_steps = max_steps
@@ -455,7 +397,7 @@ class RolloutBatchSource:
         the current set of RolloutRequests.
         """
         requests = self._requests_fn()
-        return await self._orchestrator.generate_batch(
+        return await self._engine.generate_batch(
             requests=requests,
             max_steps=self._max_steps,
             credit_assigner=self._credit_assigner,
