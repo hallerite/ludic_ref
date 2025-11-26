@@ -57,7 +57,6 @@ def _collate_saw_items(
 
     for it in items:
         L = len(it.input_ids)
-        pad_len = max_len - L
 
         ids = torch.full((max_len,), pad_token_id, dtype=torch.long)
         am = torch.zeros((max_len,), dtype=torch.long)

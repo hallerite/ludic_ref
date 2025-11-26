@@ -1,5 +1,4 @@
 from __future__ import annotations
-from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
 
 import torch  # type: ignore

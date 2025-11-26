@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 from collections import defaultdict
 from typing import Optional, Tuple, List, Dict, Any
 
 import pytest
-import torch
-from torch import nn
 
 from ludic.env import Env
 from ludic.types import Observation, Info, StepOutcome, SamplingArgs
-from ludic.agent import Agent
 from ludic.context.full_dialog import FullDialog
 from ludic.training.types import (
     RolloutRequest,

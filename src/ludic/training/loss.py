@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Protocol, Tuple, List
 
 import torch
-from torch import nn, Tensor
+from torch import Tensor
 
 
 Batch = Mapping[str, Tensor]
@@ -253,15 +253,9 @@ class EntropyBonus:
     """
 
     coeff: float = 0.01
-    use_action_mask: bool = True
 
     def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
-        input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
-        
-        # We also need attention_mask if not using action_mask
-        attention_mask = batch["attention_mask"] if not self.use_action_mask else None
-
 
         logprobs = torch.log_softmax(logits, dim=-1)
         probs = torch.exp(logprobs)
@@ -269,15 +263,7 @@ class EntropyBonus:
         # token entropy: [B, T]
         token_entropy = -(probs * logprobs).sum(dim=-1)
 
-        if self.use_action_mask:
-            mask = action_mask.to(token_entropy.dtype)
-        else:
-            # Fallback to attention_mask if not using action_mask
-            if attention_mask is None:
-                # This should not happen if logic is correct
-                raise ValueError("attention_mask is needed but not available")
-            mask = attention_mask.to(token_entropy.dtype)
-
+        mask = action_mask.to(token_entropy.dtype)
 
         masked_entropy = token_entropy * mask   # [B, T]
         # avoid divide-by-zero if mask is all zeros

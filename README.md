@@ -1,1 +1,2 @@
-# Ludic - a hackable training framework for the era of experience
+# Ludic 
+## a hackable training framework for the era of experience
