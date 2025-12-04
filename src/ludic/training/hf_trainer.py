@@ -126,12 +126,14 @@ class LudicIterableDataset(IterableDataset):
     """
     Bridges the async BatchSource to synchronous HF Trainer.
     
+    Yields WHOLE EPISODES (List[SAWItem]), not individual steps.
+    This ensures that when HF Trainer requests 'batch_size=8', it gets 
+    8 full episodes (containing ~80 steps total), not 8 individual steps.
+    
     Features:
     1. Uses `AsyncLoopBridge` to prevent connection pool deadlocks.
     2. Uses `GenerationGate` to ensure data generation waits for weight syncs (On-Policy).
-    3. Groups raw steps by Rollout ID and yields **Whole Episodes** (List[SAWItem]).
-       This ensures that `batch_size=8` in Trainer config corresponds to 
-       8 Full Rollouts, not 8 individual steps.
+    3. Groups raw steps by Rollout ID.
     """
     def __init__(self, batch_source: BatchSource, bridge: AsyncLoopBridge, gate: GenerationGate):
         self.batch_source = batch_source
@@ -158,7 +160,7 @@ class LudicIterableDataset(IterableDataset):
                 
                 # Yield lists of items (each list is one full episode)
                 for r_id, items in episodes.items():
-                    # Ensure steps are sorted by index
+                    # Ensure steps are sorted by index within the episode
                     items.sort(key=lambda x: x.meta.get("step_index", 0))
                     yield items
 
@@ -175,8 +177,8 @@ class LudicDataCollator:
     """
     Collates a list of Episodes (List[List[SAWItem]]) into a single flat batch tensor.
     
-    Because the Dataset yields lists (episodes), the input to __call__ is a 
-    list of lists. We flatten this into a single large batch of steps.
+    Since the Dataset now yields Lists (Episodes), the input to __call__ 
+    is a List of Lists. We flatten this into a single large batch of steps.
     """
     def __init__(self, pad_token_id: int):
         self.pad_token_id = pad_token_id
@@ -315,7 +317,7 @@ class VLLMSyncCallback(TrainerCallback):
 class LudicHFTrainer(Trainer):
     """
     HF Trainer for Ludic RL. 
-    - Data from BatchSource
+    - Data from BatchSource via AsyncLoopBridge
     - Loss via RLAlgorithm
     - Optional Reference Model support
     """
