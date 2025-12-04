@@ -128,7 +128,7 @@ class VLLMSyncCallback(TrainerCallback):
         if not (is_peft_available and isinstance(unwrapped, PeftModel)):
             for name, p in unwrapped.named_parameters():
                 if p.requires_grad:
-                    params[name] = p.detach().cpu()
+                    params[name] = p.detach()
             return params
 
         # LoRA (PeftModel)
@@ -148,10 +148,9 @@ class VLLMSyncCallback(TrainerCallback):
                     continue 
 
                 # Calculate merged weight: W_base + (B @ A) * scaling
-                # Done on CPU to avoid VRAM spikes
-                w_base = base_layer.weight.detach().cpu()
-                lora_A = module.lora_A[adapter_name].weight.detach().cpu()
-                lora_B = module.lora_B[adapter_name].weight.detach().cpu()
+                w_base = base_layer.weight.detach()
+                lora_A = module.lora_A[adapter_name].weight.detach()
+                lora_B = module.lora_B[adapter_name].weight.detach()
                 scaling = module.scaling[adapter_name]
 
                 delta = (lora_B @ lora_A) * scaling
