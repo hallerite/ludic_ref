@@ -1,7 +1,7 @@
 import atexit
 import logging
 import time
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import requests
 import torch  # type: ignore
@@ -50,6 +50,10 @@ class VLLMChatClient(ChatClient):
         enable_weight_updates:
             If True, initialize the NCCL communicator and enable
             push_update_atomic(); otherwise run in inference-only mode.
+        device:
+            The device (e.g. "cuda:0", 0, or torch.device) to bind the NCCL
+            communicator to. Defaults to 0. Important when running client on
+            multi-GPU setups (e.g. via accelerate).
     """
 
     def __init__(
@@ -60,6 +64,7 @@ class VLLMChatClient(ChatClient):
         group_port: int = 51216,
         connection_timeout_s: float = 60,
         enable_weight_updates: bool = False,
+        device: Union[str, torch.device, int] = 0,
     ) -> None:
 
         # Store configuration parameters
@@ -68,6 +73,7 @@ class VLLMChatClient(ChatClient):
         self.group_port = group_port
         self.connection_timeout_s = connection_timeout_s
         self.enable_weight_updates = enable_weight_updates
+        self.device = device
 
         # AsyncOpenAI handles the OpenAI-compatible HTTP endpoints.
         self._async_client = AsyncOpenAI(
@@ -339,8 +345,7 @@ class VLLMChatClient(ChatClient):
             rank=self._rank,
             world_size=world_size,
         )
-        device = 0
-        self._pynccl_comm = PyNcclCommunicator(pg, device=device)
+        self._pynccl_comm = PyNcclCommunicator(pg, device=self.device)
 
     def reset_prefix_cache(self) -> None:
         r = self._session.post(f"{self.server_url}/reset_prefix_cache", timeout=30.0)

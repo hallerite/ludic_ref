@@ -1,250 +1,196 @@
 import os
 import sys
 import time
-import signal
 import subprocess
-import asyncio
+import signal
 import logging
-from typing import List
+import asyncio
+from typing import Dict, Any
+
+# Ensure we can import examples.envs
+sys.path.append(os.getcwd())
 
 import torch
+import torch.distributed as dist
+from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from accelerate import Accelerator
 
-from ludic.agent import Agent
-from ludic.context.full_dialog import FullDialog
-from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference.sampling import SamplingArgs
-from ludic.parsers import xml_move_parser
-from ludic.training.algorithm import make_reinforce
-from ludic.training.config import TrainerConfig
-from ludic.training.rollout_engine import (
-    RolloutEngine,
-    RolloutBatchSource,
-    EnvRegistry,
-    ProtocolRegistry,
-)
-from ludic.training.trainer import Trainer
-from ludic.training.types import (
-    RolloutRequest,
-    EnvSpec,
-    ProtocolSpec,
-)
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
-
+from ludic.inference.sampling import SamplingConfig
 from examples.envs.tic_tac_toe import TicTacToeEnv
 
 # ---------------------------------------------------------------------------
-# Configuration
+# 1. Self-Contained NCCL Client (Hidden Shenanigans)
+# ---------------------------------------------------------------------------
+import requests
+from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+from vllm.distributed.utils import StatelessProcessGroup
+
+class MinimalVLLMClient:
+    """
+    A unified client that handles HTTP generation and NCCL weight syncing.
+    """
+    def __init__(self, host: str, port: int, group_port: int, accelerator: Accelerator):
+        self.base_url = f"http://{host}:{port}"
+        self.group_port = group_port
+        self.accelerator = accelerator
+        self.session = requests.Session()
+        self.pynccl_comm = None
+        self.rank = None
+
+    def wait_for_server(self, timeout=60):
+        print(f"⏳ Connecting to vLLM at {self.base_url}...")
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                if self.session.get(f"{self.base_url}/health", timeout=1).status_code == 200:
+                    print("✅ vLLM Connected")
+                    return
+            except:
+                time.sleep(1)
+        raise TimeoutError("vLLM failed to start")
+
+    def init_sync(self):
+        """Initializes the NCCL connection using Accelerator's device info."""
+        # 1. Get world size from vLLM
+        resp = self.session.get(f"{self.base_url}/get_world_size")
+        vllm_world_size = resp.json()["world_size"]
+        
+        # 2. Configure our rank (we are the client, so we are rank + 1)
+        total_world_size = vllm_world_size + 1
+        self.rank = vllm_world_size
+
+        # 3. Tell vLLM to open its side of the connection
+        # Note: vLLM's host is 0.0.0.0 from its perspective
+        self.session.post(f"{self.base_url}/init_communicator", json={
+            "host": "0.0.0.0", "port": self.group_port, "world_size": total_world_size
+        })
+        time.sleep(0.5) # Allow vLLM to bind port
+
+        # 4. Create our side using Accelerator's device
+        pg = StatelessProcessGroup.create(
+            host="127.0.0.1", port=self.group_port, rank=self.rank, world_size=total_world_size
+        )
+        self.pynccl_comm = PyNcclCommunicator(pg, device=self.accelerator.device)
+
+    def sync_weights(self, model):
+        """Push all trainable weights to vLLM via NCCL."""
+        for name, param in model.named_parameters():
+            if not param.requires_grad: continue
+            
+            # 1. Notify vLLM via HTTP
+            dtype = str(param.dtype)
+            shape = tuple(param.shape)
+            self.session.post(f"{self.base_url}/update_named_param", json={
+                "name": name, "dtype": dtype, "shape": shape
+            })
+            
+            # 2. Push Data via NCCL
+            self.pynccl_comm.broadcast(param.data, src=self.rank)
+            self.pynccl_comm.group.barrier()
+        
+        # Reset cache so vLLM uses new weights
+        self.session.post(f"{self.base_url}/reset_prefix_cache")
+
+    def generate(self, prompts: list[str], sampling_params: dict):
+        """Standard OpenAI-compatible completion"""
+        resp = self.session.post(f"{self.base_url}/v1/completions", json={
+            "model": "model", # dummy name
+            "prompt": prompts,
+            **sampling_params
+        })
+        return resp.json()
+
+# ---------------------------------------------------------------------------
+# 2. The Training Script
 # ---------------------------------------------------------------------------
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 VLLM_PORT = 8000
 NCCL_PORT = 51216
 
-# Training Params
-BATCH_SIZE = 8       # Episodes per step
-NUM_STEPS = 10       # Total training steps
-LR = 1e-5
-
-# ---------------------------------------------------------------------------
-# Helper: Launch vLLM on GPU 0
-# ---------------------------------------------------------------------------
-
-def launch_vllm_server_on_gpu0():
-    """
-    Launches vLLM as a subprocess.
-    Crucially, we override CUDA_VISIBLE_DEVICES to '0' for this process,
-    even though the main script is running on '1'.
-    """
-    print(f"🚀 Launching vLLM server on GPU 0 (Port {VLLM_PORT})...")
-    
-    # Copy current env, but force GPU 0
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0"
-    
-    cmd = [
-        sys.executable, "-m", "ludic.inference.vllm_server",
-        "--model", MODEL_NAME,
-        "--port", str(VLLM_PORT),
-        "--gpu-memory-utilization", "0.8",
-        "--max-model-len", "2048",
-        "--enforce-eager",             # Often more stable for RL loops
-        "--disable-log-stats",         # Reduce noise
-    ]
-
-    process = subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=subprocess.DEVNULL,     # Redirect stdout to keep main logs clean
-        stderr=subprocess.PIPE,        # Capture stderr for debugging if needed
-        text=True
-    )
-    return process
-
-def wait_for_vllm(process):
-    """Polls the vLLM health endpoint until it is up."""
-    import requests
-    url = f"http://127.0.0.1:{VLLM_PORT}/health"
-    print("⏳ Waiting for vLLM to be healthy...")
-    
-    for _ in range(60): # Wait up to 60s
-        if process.poll() is not None:
-            stdout, stderr = process.communicate()
-            raise RuntimeError(f"vLLM process died!\nSTDERR: {stderr}")
-        try:
-            if requests.get(url, timeout=1).status_code == 200:
-                print("✅ vLLM is ready!")
-                return
-        except Exception:
-            time.sleep(1)
-            
-    raise TimeoutError("vLLM failed to start in time.")
-
-# ---------------------------------------------------------------------------
-# Main Training Script
-# ---------------------------------------------------------------------------
-
 def main():
-    logging.basicConfig(level=logging.INFO)
-
-    # 1. Start the vLLM Server (GPU 0)
-    vllm_proc = launch_vllm_server_on_gpu0()
+    # --- A. Initialize Accelerate ---
+    # This handles device placement, un-wrapping, and distributed setup automatically.
+    accelerator = Accelerator()
+    
+    # --- B. Launch vLLM (Background) ---
+    # We force vLLM to GPU 0. Accelerator will put our script on GPU 1.
+    if accelerator.is_main_process:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = "0"
+        vllm_cmd = [
+            sys.executable, "-m", "ludic.inference.vllm_server",
+            "--model", MODEL_NAME,
+            "--port", str(VLLM_PORT),
+            "--dtype", "bfloat16",
+            "--gpu-memory-utilization", "0.8",
+            "--disable-log-stats"
+        ]
+        vllm_proc = subprocess.Popen(vllm_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     
     try:
-        wait_for_vllm(vllm_proc)
-
-        # 2. Setup Local Components (GPU 1)
-        # The main script runs on GPU 1 (provided by the user call),
-        # so we load the student model here.
-        print(f"📥 Loading local student model: {MODEL_NAME} on {os.getenv('CUDA_VISIBLE_DEVICES', 'default')}...")
+        # --- C. Load Model & components ---
+        print(f"Device: {accelerator.device}")
         
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
+        optimizer = AdamW(model.parameters(), lr=1e-5)
+
+        # Accelerate prepares everything (moves to GPU, handles DDP if needed)
+        model, optimizer = accelerator.prepare(model, optimizer)
+
+        # --- D. Initialize Client & Sync ---
+        client = MinimalVLLMClient("127.0.0.1", VLLM_PORT, NCCL_PORT, accelerator)
+        client.wait_for_server()
+        client.init_sync()
+
+        # --- E. Training Loop (Simple REINFORCE) ---
+        env = TicTacToeEnv()
+        prompt_template = env.suggested_sysprompt + "\n<move>A1</move>\n"
         
-        # Load model for training
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True
-        ).cuda() # Moves to GPU 1 automatically based on CUDA_VISIBLE_DEVICES
+        for step in range(10):
+            # 1. Generation (Rollout)
+            # We use a simplified loop here: 1 game per step for demonstration
+            prompts = [prompt_template]
+            
+            # Ask vLLM to play
+            output = client.generate(prompts, {"max_tokens": 10, "temperature": 0.8})
+            text = output['choices'][0]['text']
+            
+            # Simple Reward Logic (Did we parse XML?)
+            reward = 1.0 if "<move>" in text else -1.0
+            
+            # 2. Tokenization & Tensors
+            inputs = tokenizer(prompts[0] + text, return_tensors="pt").to(accelerator.device)
+            
+            # 3. Forward Pass (on Student)
+            outputs = model(**inputs)
+            log_probs = outputs.logits.log_softmax(dim=-1)
+            
+            # 4. Loss (Vanilla Policy Gradient)
+            # Only train on the generated tokens
+            input_ids = inputs.input_ids[0]
+            gen_start = len(tokenizer.encode(prompts[0]))
+            
+            action_log_probs = log_probs[0, gen_start-1:-1, :]
+            action_tokens = input_ids[gen_start:]
+            
+            selected_log_probs = action_log_probs.gather(1, action_tokens.unsqueeze(-1))
+            loss = -selected_log_probs.mean() * reward
 
-        # 3. Initialize Ludic Client
-        # enable_weight_updates=True is CRITICAL. It tells the client to act
-        # as a rank in the NCCL group to push weights to vLLM.
-        client = VLLMChatClient(
-            host="127.0.0.1",
-            port=VLLM_PORT,
-            group_port=NCCL_PORT,
-            enable_weight_updates=True 
-        )
+            # 5. Backward & Step
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad()
 
-        # 4. Setup Registries
-        # Define how to build the Env and the Protocol
-        env_registry: EnvRegistry = {
-            "tictactoe": lambda **kwargs: TicTacToeEnv(**kwargs)
-        }
-        
-        # We need a protocol factory that creates an agent wired to our shared client
-        def create_protocol(system_prompt: str):
-            return SingleAgentSyncProtocol(
-                agent=Agent(
-                    client=client,
-                    model=MODEL_NAME,
-                    ctx=FullDialog(system_prompt=system_prompt),
-                    parser=xml_move_parser
-                )
-            )
+            # 6. Sync Weights to vLLM
+            print(f"Step {step+1}: Reward={reward} | Syncing weights...")
+            client.sync_weights(model)
 
-        protocol_registry: ProtocolRegistry = {
-            "single_agent": create_protocol
-        }
-
-        # 5. Setup Rollout Engine & Request Factory
-        engine = RolloutEngine(
-            env_registry=env_registry,
-            protocol_registry=protocol_registry,
-            jsonl_path="rollouts.jsonl"
-        )
-
-        # Helper to generate the System Prompt with XML instructions
-        def get_system_prompt():
-            base = TicTacToeEnv().suggested_sysprompt
-            return base + "\nReply with a single XML tag, e.g. <move>A1</move>."
-
-        # Define the Batch Source
-        # This function generates the list of requests for every training step
-        def make_requests() -> List[RolloutRequest]:
-            return [
-                RolloutRequest(
-                    env=EnvSpec(kind="tictactoe"),
-                    protocol=ProtocolSpec(
-                        kind="single_agent", 
-                        kwargs={"system_prompt": get_system_prompt()}
-                    ),
-                    num_episodes=BATCH_SIZE,
-                    sampling_args=SamplingArgs(
-                        temperature=0.8, 
-                        max_tokens=100
-                    )
-                )
-            ]
-
-        # REINFORCE typically benefits from re-tokenizing locally to ensure
-        # gradients align perfectly with the training model's embeddings.
-        batch_source = RolloutBatchSource(
-            orchestrator=engine,
-            credit_assigner=make_reinforce(gamma=1.0).credit_assigner,
-            requests_fn=make_requests,
-            max_steps=10,
-            concurrency=8,
-            retokenize=True,
-            tokenize=lambda text: tokenizer.encode(text, add_special_tokens=False)
-        )
-
-        # 6. Setup Trainer
-        # Configures the optimization loop
-        trainer_config = TrainerConfig(
-            lr=LR,
-            model_device="cuda",  # Refers to the local device (GPU 1)
-            max_grad_norm=1.0,
-            sync_every_steps=1,   # Push weights to vLLM every step
-        )
-
-        trainer = Trainer(
-            model=model,
-            algo=make_reinforce(gamma=1.0),
-            batch_source=batch_source,
-            client=client,
-            cfg=trainer_config
-        )
-
-        # 7. Run Training
-        print("\n🥊 Starting Training Loop...")
-        print(f"   Device 0: vLLM Server (Inference)")
-        print(f"   Device 1: Trainer (Backprop)")
-        
-        def log_progress(stats):
-            print(f"[Step {int(stats['train_step'])}] "
-                  f"Reward: {stats['avg_total_reward']:.2f} | "
-                  f"Loss: {stats['loss']:.4f}")
-
-        # Use the synchronous wrapper for the script
-        trainer.train_sync(
-            num_steps=NUM_STEPS,
-            log_every=1,
-            log_fn=log_progress
-        )
-
-        print("✅ Training complete.")
-
-    except KeyboardInterrupt:
-        print("\nStopping...")
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
     finally:
-        # Cleanup vLLM process
-        if vllm_proc:
-            print("💀 Killing vLLM server...")
+        if accelerator.is_main_process:
+            print("💀 Killing vLLM...")
             os.kill(vllm_proc.pid, signal.SIGTERM)
 
 if __name__ == "__main__":
