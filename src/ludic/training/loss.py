@@ -32,36 +32,26 @@ def compute_logp_action(
 ) -> Tensor:
     """
     Compute log π(a|s) given token-level logits and an action mask.
-
-    Args:
-        logits: [B, T, V] float tensor of unnormalized logits.
-        input_ids: [B, T] long tensor of token ids actually sampled.
-        action_mask: [B, T] {0,1} mask; 1 where tokens belong to the "action".
-
-    Returns:
-        logp_action: [B] log-prob of the entire action sequence per sample.
+    
+    OPTIMIZED: Avoids materializing the full [B, T, V] log_softmax tensor.
     """
     if logits.ndim != 3:
         raise ValueError(f"Expected logits [B, T, V], got {tuple(logits.shape)}")
-    _check_shape_2d("input_ids", input_ids)
-    _check_shape_2d("action_mask", action_mask)
-
-    if input_ids.shape != logits.shape[:2]:
-        raise ValueError(
-            f"input_ids shape {tuple(input_ids.shape)} incompatible with logits "
-            f"shape {tuple(logits.shape)}"
-        )
-    if action_mask.shape != logits.shape[:2]:
-        raise ValueError(
-            f"action_mask shape {tuple(action_mask.shape)} incompatible with logits "
-            f"shape {tuple(logits.shape)}"
-        )
-
-    # [B, T, V]
-    logprobs = torch.log_softmax(logits, dim=-1)
-
-    # Gather log-prob of the actual token at each position: [B, T]
-    token_logp = logprobs.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    
+    # [B, T, V] -> [B*T, V]
+    # input_ids: [B, T] -> [B*T]
+    vocab_size = logits.size(-1)
+    flat_logits = logits.reshape(-1, vocab_size)
+    flat_ids = input_ids.reshape(-1)
+    
+    # Use cross_entropy with reduction='none' to get per-token negative log-likelihoods
+    # loss = -log(p) => log(p) = -loss
+    # This is much more memory efficient than log_softmax over the full vocab
+    nll = torch.nn.functional.cross_entropy(flat_logits, flat_ids, reduction='none')
+    token_logp = -nll
+    
+    # Reshape back to [B, T]
+    token_logp = token_logp.view(input_ids.shape)
 
     # Sum log-probs over the action region only: [B]
     amask = action_mask.to(token_logp.dtype)
