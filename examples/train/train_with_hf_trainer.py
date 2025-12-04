@@ -1,9 +1,7 @@
 import os
 import sys
 import time
-import signal
 import subprocess
-import asyncio
 import logging
 import requests
 import torch
@@ -13,7 +11,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from ludic.agent import Agent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference.sampling import SamplingConfig
 from ludic.parsers import xml_move_parser
 from ludic.training.rollout_engine import (
     RolloutEngine,
@@ -26,10 +23,10 @@ from ludic.training.types import (
     ProtocolSpec,
     RolloutRequest,
 )
+from ludic.types import SamplingArgs
 from ludic.training.algorithm import make_reinforce
 from ludic.training.hf_trainer import LudicHFTrainer
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
-from ludic.training.config import TrainerConfig
 
 # Import the example Env (ensure this is in your python path)
 # If running from the root of the tree provided, this path should work
@@ -171,30 +168,24 @@ def main():
                 "Output your move as a single XML tag, e.g., <move>A1</move>."
             )
             
-            # Sampling: Use a bit of temperature for exploration
-            # Important: return_token_ids=True ensures exact token alignment for RL
-            sampling = SamplingConfig(
-                seed=42, # Base seed (engine will shift this per episode)
-                temperature=1.0, 
-                max_tokens=100,
-                frequency_penalty=0,
-                presence_penalty=0,
-                top_p=1,
-                stop=[],
-                extras={"extra_body": {"return_token_ids": True}} 
-            )
+            # FIXED: Define sampling_args as a dict with the 'extras' key preserved.
+            # Do NOT use .to_openai_kwargs() here.
+            sampling_args: SamplingArgs = {
+                "seed": 42,
+                "temperature": 1.0,
+                "max_tokens": 100,
+                "stop": [],
+                # The agent looks for this 'extras' key explicitly
+                "extras": {"extra_body": {"return_token_ids": True}} 
+            }
 
             req = RolloutRequest(
                 env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
                 protocol=ProtocolSpec(kind="single_agent"),
-                sampling_args=sampling.to_openai_kwargs(), # pass dict to request
-                num_episodes=BATCH_SIZE, # Generate batch_size episodes per step
+                sampling_args=sampling_args, # Pass the dict directly
+                num_episodes=BATCH_SIZE,
                 meta={"system_prompt": sys_prompt}
             )
-            # Inject system prompt into protocol via agent reset (handled by protocol)
-            # Since SingleAgentSyncProtocol reads suggested_sysprompt from Env, 
-            # we subclass Env or just trust the Env's prompt. 
-            # In this example, TicTacToeEnv has a default prompt.
             return [req]
 
         # The Batch Source feeds the Trainer
@@ -211,15 +202,6 @@ def main():
 
         # 5. Configure RL Algorithm & Trainer
         algorithm = make_reinforce(gamma=0.99)
-        
-        # Ludic Trainer Config (optimization settings)
-        ludic_config = TrainerConfig(
-            model_device=f"cuda:{TRAINER_GPU_ID}",
-            lr=LEARNING_RATE,
-            grad_accum_steps=GRAD_ACCUM,
-            sync_every_steps=1, # Sync weights to vLLM after every step
-            pad_token_id=tokenizer.pad_token_id
-        )
 
         # HF Training Arguments (logging, saving, etc.)
         hf_args = TrainingArguments(
