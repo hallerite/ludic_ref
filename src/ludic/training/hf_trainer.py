@@ -93,29 +93,38 @@ class AsyncLoopBridge:
 
 
 # ---------------------------------------------------------------------------
-# 0.5 Generation Gate
+# 0.5 Generation Gate (TURNSTILE LOGIC)
 # ---------------------------------------------------------------------------
 
 class GenerationGate:
     """
-    Forces the Dataset to wait until the Trainer has finished a step (and synced weights)
-    before generating the next batch. This ensures strict On-Policy training.
+    Acts as a turnstile for data generation.
+    
+    States:
+    - OPEN: Dataset can fetch new data (Training is waiting for data).
+    - CLOSED: Dataset blocks (Training is in progress).
+    
+    Lifecycle:
+    1. Init: OPEN.
+    2. Dataset: Fetches data, passes it to Trainer.
+    3. Trainer: Starts step -> `on_step_begin` -> CLOSES Gate.
+    4. Trainer: Finishes step -> `on_step_end` -> Syncs Weights -> OPENS Gate.
     """
     def __init__(self):
-        # Start true so the very first batch can be fetched immediately
-        self._can_generate = threading.Event()
-        self._can_generate.set()
+        self._event = threading.Event()
+        self._event.set() # Start OPEN so first batch can be fetched
 
-    def wait_for_signal(self):
-        """Called by Dataset before fetching new data."""
-        self._can_generate.wait()
-        # Once we pass the gate, we clear it. 
-        # It won't open again until the Callback sets it.
-        self._can_generate.clear()
+    def wait(self):
+        """Block the Dataset thread if the gate is CLOSED."""
+        self._event.wait()
 
-    def signal_step_complete(self):
-        """Called by Callback after weight sync."""
-        self._can_generate.set()
+    def close(self):
+        """Block further generation (Training in progress)."""
+        self._event.clear()
+
+    def open(self):
+        """Allow generation (Training/Sync done)."""
+        self._event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -142,14 +151,19 @@ class LudicIterableDataset(IterableDataset):
 
     def __iter__(self):
         while True:
-            # --- BLOCKING WAIT ---
-            # Wait for the previous training step & sync to finish.
-            self.gate.wait_for_signal()
+            # --- TURNSTILE WAIT ---
+            # If the Trainer is currently optimizing (Gate Closed), we block here.
+            # We only proceed when weights are synced and Gate opens.
+            self.gate.wait()
             
             try:
                 # Fetch new batch (using the NEW synced weights)
                 saw_batch = self.bridge.run_sync(self.batch_source.next_batch())
                 
+                # Handling empty batches from engine (just in case)
+                if not saw_batch.items:
+                    continue
+
                 # --- Group items by Rollout ID ---
                 # We need to reconstruct episodes so the Collator can treat 
                 # "One Episode" as "One Example".
@@ -228,12 +242,12 @@ class LudicDataCollator:
 
 
 # ---------------------------------------------------------------------------
-# 3. Sync Callback (LoRA Aware)
+# 3. Sync Callback (UPDATED: Controls Turnstile)
 # ---------------------------------------------------------------------------
 
 class VLLMSyncCallback(TrainerCallback):
     """
-    Pushes weights to vLLM at the end of N steps and signals the GenerationGate.
+    Pushes weights to vLLM at the end of N steps and controls the GenerationGate.
     If using LoRA, merges adapters on-the-fly before pushing.
     """
     def __init__(self, client: ChatClient, model: nn.Module, gate: GenerationGate, sync_every_steps: int = 1):
@@ -242,14 +256,24 @@ class VLLMSyncCallback(TrainerCallback):
         self.gate = gate
         self.sync_every_steps = sync_every_steps
 
+    def on_step_begin(self, args, state, control, **kwargs):
+        """
+        Called BEFORE the training step starts (forward pass).
+        CLOSE the gate to prevent the Dataset from fetching new data 
+        while we are in the middle of an update.
+        """
+        self.gate.close()
+
     def on_step_end(self, args, state, control, **kwargs):
-        # 1. Check if we need to sync
+        """
+        Called AFTER the training step (optimizer update).
+        1. Sync weights to vLLM.
+        2. OPEN the gate to allow generating data with the NEW weights.
+        """
         if state.global_step % self.sync_every_steps == 0:
             self._push_weights()
         
-        # 2. IMPORTANT: Signal the dataset that it is safe to generate the NEXT batch.
-        # We do this after the push_weights() blocks and returns.
-        self.gate.signal_step_complete()
+        self.gate.open()
 
     def _get_merged_params(self, model: nn.Module) -> Dict[str, torch.Tensor]:
         params = {}
@@ -350,7 +374,7 @@ class LudicHFTrainer(Trainer):
         self.bridge = AsyncLoopBridge()
         self.bridge.start()
         
-        # 2. Initialize the Gate to control On-Policy flow
+        # 2. Initialize the Turnstile Gate (Starts OPEN)
         self.gate = GenerationGate()
 
         # 3. Pass bridge and gate to Dataset
@@ -366,7 +390,7 @@ class LudicHFTrainer(Trainer):
         sync_callback = VLLMSyncCallback(
             client=client, 
             model=model, 
-            gate=self.gate, # Callback releases the gate after sync
+            gate=self.gate, # Controls the gate
             sync_every_steps=getattr(args, "sync_every_steps", 1)
         )
         callbacks = kwargs.get("callbacks", []) + [sync_callback]
