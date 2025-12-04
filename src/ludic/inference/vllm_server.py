@@ -2,7 +2,7 @@ import asyncio
 import os
 import signal
 from argparse import Namespace
-from typing import Any, Awaitable, Sequence, Set, Optional
+from typing import Any, Awaitable, Sequence, Set, Optional, List, Tuple
 
 # Use V1 engine explicitly.
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -116,9 +116,35 @@ class WeightSyncWorkerExtension:
         assert self.device is not None
         weight = torch.empty(shape, dtype=torch_dtype, device=self.device)
         self.pynccl_comm.broadcast(weight, src=self.client_rank)
-        self.pynccl_comm.group.barrier()
         # vLLM model runner will apply the incoming weights
         self.model_runner.model.load_weights(weights=[(name, weight)])  # type: ignore[attr-defined]
+
+    def batch_update_named_params(self, params_metadata: List[Tuple[str, str, Sequence[int]]]) -> None:
+        """
+        Receives a BATCH of parameters.
+        Iterates through the metadata list and performs NCCL broadcasts strictly in order.
+        This aligns with the Client's iteration loop.
+        """
+        if self.pynccl_comm is None or self.client_rank is None:
+            raise RuntimeError("Communicator not initialized.")
+
+        assert self.device is not None
+        
+        # Iterating through the list matches the Client's send order perfectly.
+        for name, dtype, shape in params_metadata:
+            torch_dtype = getattr(torch, dtype.split(".")[-1])
+            
+            # Allocate
+            weight = torch.empty(shape, dtype=torch_dtype, device=self.device)
+            
+            # Receive (Blocking)
+            self.pynccl_comm.broadcast(weight, src=self.client_rank)
+            
+            # Load into model
+            self.model_runner.model.load_weights(weights=[(name, weight)]) # type: ignore
+            
+        # Optional: Barrier to confirm batch completion on all workers
+        self.pynccl_comm.group.barrier()
 
     def close_communicator(self) -> None:
         """
@@ -348,7 +374,7 @@ async def run_server(args: Namespace) -> None:
     @app.post("/update_named_param")
     async def update_named_param(request: Request) -> dict[str, str]:
         """
-        Update a single named parameter.
+        Update a single named parameter (Legacy/Fallback).
 
         Client side:
           1) POST name/dtype/shape here
@@ -377,29 +403,35 @@ async def run_server(args: Namespace) -> None:
     @app.post("/push_update_atomic")
     async def push_update_atomic(request: Request) -> dict[str, Any]:
         """
-        Optional batched update endpoint.
+        Batched update endpoint.
 
         Body: { "params": [ {name, dtype, shape}, ... ], "version": "optional-tag" }
 
         Semantics:
-          - Schedules a background task that calls update_named_param for each param.
-          - Bumps RUNTIME_VERSION once all workers have processed the batch.
-          - HTTP returns immediately after scheduling; client can poll
-            /get_num_background_tasks or /runtime_version if it wants to wait.
+          - Receives full list of metadata.
+          - Sends ONE RPC command to workers ("batch_update_named_params").
+          - Workers loop and match the Client's NCCL broadcast stream.
+          - Bumps RUNTIME_VERSION once complete.
         """
         data = await request.json()
-        params = data.get("params", [])
+        params = data.get("params", []) # List[Dict]
         requested_version = data.get("version")
+
+        # Convert dicts to tuples for safe RPC serialization
+        # params structure: [{"name": str, "dtype": str, "shape": list}, ...]
+        params_metadata = [
+            (p["name"], p["dtype"], tuple(p["shape"])) 
+            for p in params
+        ]
 
         async def do_update() -> None:
             async with weight_update_semaphore:
-                for p in params:
-                    name = p["name"]
-                    dtype = p["dtype"]
-                    shape = tuple(p["shape"])
-                    await engine.collective_rpc(
-                        "update_named_param", args=(name, dtype, shape)
-                    )
+                # SINGLE RPC CALL for all parameters.
+                # Workers will enter a loop and receive streams from client.
+                await engine.collective_rpc(
+                    "batch_update_named_params", args=(params_metadata,)
+                )
+                
                 global RUNTIME_VERSION
                 async with RUNTIME_VERSION_LOCK:
                     RUNTIME_VERSION += 1
