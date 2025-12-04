@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import logging
+from collections import defaultdict
 from typing import Dict, List, Optional, TypeVar, Coroutine, Any
 from contextlib import nullcontext
 
@@ -92,59 +93,124 @@ class AsyncLoopBridge:
 
 
 # ---------------------------------------------------------------------------
+# 0.5 Generation Gate
+# ---------------------------------------------------------------------------
+
+class GenerationGate:
+    """
+    Forces the Dataset to wait until the Trainer has finished a step (and synced weights)
+    before generating the next batch. This ensures strict On-Policy training.
+    """
+    def __init__(self):
+        # Start true so the very first batch can be fetched immediately
+        self._can_generate = threading.Event()
+        self._can_generate.set()
+
+    def wait_for_signal(self):
+        """Called by Dataset before fetching new data."""
+        self._can_generate.wait()
+        # Once we pass the gate, we clear it. 
+        # It won't open again until the Callback sets it.
+        self._can_generate.clear()
+
+    def signal_step_complete(self):
+        """Called by Callback after weight sync."""
+        self._can_generate.set()
+
+
+# ---------------------------------------------------------------------------
 # 1. Dataset Adapter
 # ---------------------------------------------------------------------------
 
 class LudicIterableDataset(IterableDataset):
     """
     Bridges the async BatchSource to synchronous HF Trainer.
-    Uses the persistent bridge to fetch batches safely.
+    
+    Features:
+    1. Uses `AsyncLoopBridge` to prevent connection pool deadlocks.
+    2. Uses `GenerationGate` to ensure data generation waits for weight syncs (On-Policy).
+    3. Groups raw steps by Rollout ID and yields **Whole Episodes** (List[SAWItem]).
+       This ensures that `batch_size=8` in Trainer config corresponds to 
+       8 Full Rollouts, not 8 individual steps.
     """
-    def __init__(self, batch_source: BatchSource, bridge: AsyncLoopBridge):
+    def __init__(self, batch_source: BatchSource, bridge: AsyncLoopBridge, gate: GenerationGate):
         self.batch_source = batch_source
         self.bridge = bridge
+        self.gate = gate
 
     def __iter__(self):
         while True:
+            # --- BLOCKING WAIT ---
+            # Wait for the previous training step & sync to finish.
+            self.gate.wait_for_signal()
+            
             try:
+                # Fetch new batch (using the NEW synced weights)
                 saw_batch = self.bridge.run_sync(self.batch_source.next_batch())
+                
+                # --- Group items by Rollout ID ---
+                # We need to reconstruct episodes so the Collator can treat 
+                # "One Episode" as "One Example".
+                episodes: Dict[str, List[SAWItem]] = defaultdict(list)
+                for item in saw_batch.items:
+                    r_id = item.meta.get("rollout_id", "unknown")
+                    episodes[r_id].append(item)
+                
+                # Yield lists of items (each list is one full episode)
+                for r_id, items in episodes.items():
+                    # Ensure steps are sorted by index
+                    items.sort(key=lambda x: x.meta.get("step_index", 0))
+                    yield items
+
             except Exception as e:
                 logger.error(f"Error fetching batch from source: {e}")
                 raise e
-            
-            # Yield individual items to HF DataCollator
-            yield from saw_batch.items
 
 
 # ---------------------------------------------------------------------------
-# 2. Collator (Inlined Logic)
+# 2. Collator
 # ---------------------------------------------------------------------------
 
 class LudicDataCollator:
     """
-    Collates a list of SAWItems into a dictionary of tensors.
-    Pads input_ids to the max length in the batch.
+    Collates a list of Episodes (List[List[SAWItem]]) into a single flat batch tensor.
+    
+    Because the Dataset yields lists (episodes), the input to __call__ is a 
+    list of lists. We flatten this into a single large batch of steps.
     """
     def __init__(self, pad_token_id: int):
         self.pad_token_id = pad_token_id
 
-    def __call__(self, items: List[SAWItem]) -> Dict[str, torch.Tensor]:
-        if not items:
-            raise ValueError("Cannot collate empty list of SAWItems")
+    def __call__(self, episodes: List[List[SAWItem]]) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            episodes: A list of 'batch_size' episodes. 
+                      Each episode is a list of SAWItems.
+        """
+        if not episodes:
+            raise ValueError("Cannot collate empty list of episodes")
 
-        # 1. Determine batch shape
-        lengths = [len(it.input_ids) for it in items]
+        # 1. Flatten the list of lists into a single list of items
+        #    e.g., batch_size=8 rollouts -> ~80 total steps
+        all_items: List[SAWItem] = [item for episode in episodes for item in episode]
+
+        if not all_items:
+             raise ValueError("Episodes contained no steps")
+
+        # 2. Determine batch shape from the flattened list
+        lengths = [len(it.input_ids) for it in all_items]
         max_len = max(lengths)
-        batch_size = len(items)
+        total_steps = len(all_items)
         
-        # 2. Allocate tensors (CPU)
-        input_ids = torch.full((batch_size, max_len), self.pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
-        action_mask = torch.zeros((batch_size, max_len), dtype=torch.float32)
-        weights = torch.zeros((batch_size,), dtype=torch.float32)
+        # 3. Allocate tensors (CPU)
+        # Note: dim 0 is now Total Steps across all episodes
+        input_ids = torch.full((total_steps, max_len), self.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((total_steps, max_len), dtype=torch.long)
+        action_mask = torch.zeros((total_steps, max_len), dtype=torch.float32)
+        weights = torch.zeros((total_steps,), dtype=torch.float32)
 
-        # 3. Fill
-        for i, it in enumerate(items):
+        # 4. Fill
+        for i, it in enumerate(all_items):
             L = len(it.input_ids)
             input_ids[i, :L] = torch.tensor(it.input_ids, dtype=torch.long)
             attention_mask[i, :L] = torch.tensor(it.attention_mask, dtype=torch.long)
@@ -165,17 +231,23 @@ class LudicDataCollator:
 
 class VLLMSyncCallback(TrainerCallback):
     """
-    Pushes weights to vLLM at the end of N steps.
+    Pushes weights to vLLM at the end of N steps and signals the GenerationGate.
     If using LoRA, merges adapters on-the-fly before pushing.
     """
-    def __init__(self, client: ChatClient, model: nn.Module, sync_every_steps: int = 1):
+    def __init__(self, client: ChatClient, model: nn.Module, gate: GenerationGate, sync_every_steps: int = 1):
         self.client = client
         self.model = model
+        self.gate = gate
         self.sync_every_steps = sync_every_steps
 
     def on_step_end(self, args, state, control, **kwargs):
+        # 1. Check if we need to sync
         if state.global_step % self.sync_every_steps == 0:
             self._push_weights()
+        
+        # 2. IMPORTANT: Signal the dataset that it is safe to generate the NEXT batch.
+        # We do this after the push_weights() blocks and returns.
+        self.gate.signal_step_complete()
 
     def _get_merged_params(self, model: nn.Module) -> Dict[str, torch.Tensor]:
         params = {}
@@ -243,7 +315,7 @@ class VLLMSyncCallback(TrainerCallback):
 class LudicHFTrainer(Trainer):
     """
     HF Trainer for Ludic RL. 
-    - Data from BatchSource via AsyncLoopBridge
+    - Data from BatchSource
     - Loss via RLAlgorithm
     - Optional Reference Model support
     """
@@ -271,20 +343,28 @@ class LudicHFTrainer(Trainer):
             self.ref_model.eval()
             self.ref_model.to(args.device)
 
-        # --- ASYNC BRIDGE SETUP ---
+        # --- SETUP ASYNC INFRASTRUCTURE ---
         # 1. Start the persistent background loop
         self.bridge = AsyncLoopBridge()
         self.bridge.start()
+        
+        # 2. Initialize the Gate to control On-Policy flow
+        self.gate = GenerationGate()
 
-        # 2. Pass the bridge to the dataset
-        train_dataset = LudicIterableDataset(batch_source, bridge=self.bridge)
-        # --------------------------
+        # 3. Pass bridge and gate to Dataset
+        train_dataset = LudicIterableDataset(
+            batch_source, 
+            bridge=self.bridge, 
+            gate=self.gate
+        )
+        # ----------------------------------
 
         data_collator = LudicDataCollator(pad_token_id=pad_token_id)
         
         sync_callback = VLLMSyncCallback(
             client=client, 
             model=model, 
+            gate=self.gate, # Callback releases the gate after sync
             sync_every_steps=getattr(args, "sync_every_steps", 1)
         )
         callbacks = kwargs.get("callbacks", []) + [sync_callback]
