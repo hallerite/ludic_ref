@@ -1,6 +1,7 @@
 import atexit
 import logging
 import time
+import asyncio
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import requests
@@ -74,12 +75,11 @@ class VLLMChatClient(ChatClient):
         self.connection_timeout_s = connection_timeout_s
         self.enable_weight_updates = enable_weight_updates
         self.device = device
+        self.vllm_base_url = f"http://{self.host}:{self.port}/v1"
 
-        # AsyncOpenAI handles the OpenAI-compatible HTTP endpoints.
-        self._async_client = AsyncOpenAI(
-            base_url=f"http://{self.host}:{self.port}/v1",
-            api_key="local",
-        )
+        # Do NOT initialize AsyncOpenAI here. It binds to the current loop/thread.
+        # Instead, we cache one client per event loop.
+        self._loop_bound_clients: Dict[asyncio.AbstractEventLoop, AsyncOpenAI] = {}
 
         # Sync HTTP client for health checks and weight-update metadata RPC
         self._session = requests.Session()
@@ -98,6 +98,25 @@ class VLLMChatClient(ChatClient):
         if self.enable_weight_updates:
             self._init_communicator()
             atexit.register(self.close_communicator)
+
+    def _get_async_client(self) -> AsyncOpenAI:
+        """
+        Returns an AsyncOpenAI client bound to the CURRENT running event loop.
+        This ensures thread safety when called from AsyncLoopBridge.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError("VLLMChatClient.complete called outside of an event loop.")
+
+        if loop not in self._loop_bound_clients:
+            # Create a fresh client for this specific loop
+            self._loop_bound_clients[loop] = AsyncOpenAI(
+                base_url=self.vllm_base_url,
+                api_key="local",
+            )
+        
+        return self._loop_bound_clients[loop]
 
     # ---- ChatClient.complete ------------------------------------
 
@@ -188,9 +207,11 @@ class VLLMChatClient(ChatClient):
             request_kwargs["extra_body"] = extra_body
 
         # ----------------------------------------------------------
-        # Perform inference
+        # Perform inference using the LOOP-BOUND client
         # ----------------------------------------------------------
-        resp = await self._async_client.chat.completions.create(**request_kwargs)
+        client = self._get_async_client()
+        
+        resp = await client.chat.completions.create(**request_kwargs)
 
         choice = resp.choices[0]
         text = choice.message.content or ""
@@ -246,6 +267,8 @@ class VLLMChatClient(ChatClient):
                 )
             raise RuntimeError("Communicator not initialized.")
 
+        # Log start of sync to help diagnose deadlocks
+        log.info(f"Starting push_update_atomic for {len(params)} parameters...")
         start = time.time()
 
         for name, tensor in params.items():
@@ -270,7 +293,10 @@ class VLLMChatClient(ChatClient):
                 )
 
             # Broadcast the parameter to vLLM worker processes
+            # This is a BLOCKING NCCL CALL.
             self._pynccl_comm.broadcast(tensor, src=self._rank)
+            
+            # Barrier ensures server workers have received it before we continue
             self._pynccl_comm.group.barrier()
 
             if (time.time() - start) > timeout_s:
@@ -283,6 +309,7 @@ class VLLMChatClient(ChatClient):
         while self.get_num_background_tasks() > 0:
             time.sleep(0.2)
 
+        log.info("push_update_atomic complete.")
         return version or f"vllm-{int(time.time())}"
 
     # ---- Control-plane helpers ---------------------------------
