@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TypeVar, Coroutine, Any
 from contextlib import nullcontext
 
 import torch
@@ -30,6 +31,65 @@ except ImportError:
     PeftModel = None
     LoraLayer = None
 
+T = TypeVar("T")
+
+
+# ---------------------------------------------------------------------------
+# 0. Async Loop Bridge
+# ---------------------------------------------------------------------------
+
+class AsyncLoopBridge:
+    """
+    Spins up a dedicated background thread with a permanent asyncio loop.
+    This allows synchronous code (HF Trainer) to call async code (RolloutEngine/vLLM)
+    without destroying the event loop and breaking persistent HTTP connection pools.
+    """
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+
+        def _target() -> None:
+            # Create a new loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            self._ready.set()
+            # Run forever so httpx connections stay alive across batches
+            loop.run_forever()
+
+        self._thread = threading.Thread(target=_target, daemon=True)
+        self._thread.start()
+        # Block main thread until the background loop is actually running
+        self._ready.wait()
+
+    def stop(self) -> None:
+        if self._loop is not None:
+            # Schedule the stop in the loop's thread
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            # Wait for the thread to finish
+            if self._thread is not None:
+                self._thread.join()
+            self._loop = None
+            self._thread = None
+
+    def run_sync(self, coro: Coroutine[Any, Any, T]) -> T:
+        """
+        Submit a coroutine to the background loop and block the 
+        main thread until the result is ready.
+        """
+        if self._loop is None:
+            raise RuntimeError("AsyncLoopBridge not started. Call start() first.")
+        
+        # Thread-safe submission to the background loop
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        # Block here (synchronously) until the async work is done
+        return future.result()
+
 
 # ---------------------------------------------------------------------------
 # 1. Dataset Adapter
@@ -38,16 +98,16 @@ except ImportError:
 class LudicIterableDataset(IterableDataset):
     """
     Bridges the async BatchSource to synchronous HF Trainer.
-    Blocks the main thread to fetch batches via asyncio.run().
+    Uses the persistent bridge to fetch batches safely.
     """
-    def __init__(self, batch_source: BatchSource):
+    def __init__(self, batch_source: BatchSource, bridge: AsyncLoopBridge):
         self.batch_source = batch_source
+        self.bridge = bridge
 
     def __iter__(self):
         while True:
             try:
-                # Fetch one "macro-batch" from the source
-                saw_batch = asyncio.run(self.batch_source.next_batch())
+                saw_batch = self.bridge.run_sync(self.batch_source.next_batch())
             except Exception as e:
                 logger.error(f"Error fetching batch from source: {e}")
                 raise e
@@ -183,7 +243,7 @@ class VLLMSyncCallback(TrainerCallback):
 class LudicHFTrainer(Trainer):
     """
     HF Trainer for Ludic RL. 
-    - Data from BatchSource
+    - Data from BatchSource via AsyncLoopBridge
     - Loss via RLAlgorithm
     - Optional Reference Model support
     """
@@ -211,7 +271,15 @@ class LudicHFTrainer(Trainer):
             self.ref_model.eval()
             self.ref_model.to(args.device)
 
-        train_dataset = LudicIterableDataset(batch_source)
+        # --- ASYNC BRIDGE SETUP ---
+        # 1. Start the persistent background loop
+        self.bridge = AsyncLoopBridge()
+        self.bridge.start()
+
+        # 2. Pass the bridge to the dataset
+        train_dataset = LudicIterableDataset(batch_source, bridge=self.bridge)
+        # --------------------------
+
         data_collator = LudicDataCollator(pad_token_id=pad_token_id)
         
         sync_callback = VLLMSyncCallback(
@@ -229,6 +297,18 @@ class LudicHFTrainer(Trainer):
             callbacks=callbacks,
             **kwargs
         )
+
+    # --- CLEANUP HOOK ---
+    def _inner_training_loop(self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None):
+        """
+        Wrap the training loop to ensure the background thread is killed
+        even if training crashes or finishes early.
+        """
+        try:
+            return super()._inner_training_loop(batch_size, args, resume_from_checkpoint, trial, ignore_keys_for_eval)
+        finally:
+            if hasattr(self, 'bridge'):
+                self.bridge.stop()
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # 1. Run Reference Model (if required)
