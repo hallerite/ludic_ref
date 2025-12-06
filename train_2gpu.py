@@ -1,13 +1,31 @@
 import os
 import sys
 import time
-import subprocess
 import logging
-import multiprocessing
 import requests
+import torch
+from transformers import AutoModelForCausalLM
 
-# NOTE: We keep top-level imports minimal to avoid premature CUDA init in the main process
+# Ludic Imports
+from ludic.agent import Agent
+from ludic.context.full_dialog import FullDialog
+from ludic.inference.vllm_client import VLLMChatClient
+from ludic.parsers import xml_move_parser
+from ludic.training.rollout_engine import RolloutEngine, RolloutBatchSource, EnvRegistry, ProtocolRegistry
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
+from ludic.training.algorithm import make_reinforce
+from ludic.training.trainer import Trainer
+from ludic.training.config import TrainerConfig
+from ludic.interaction.single_agent import SingleAgentSyncProtocol
+from ludic.distributed.adapters import create_vllm_publisher
+
+# Import Env
+try:
+    from examples.envs.tic_tac_toe import TicTacToeEnv
+except ImportError:
+    # Fallback if running from a different directory
+    print("⚠️ Could not import TicTacToeEnv from examples. Using Mock.")
+    from tests._mocks import MockEnv as TicTacToeEnv
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -18,107 +36,44 @@ VLLM_HOST = "127.0.0.1"
 VLLM_PORT = 8000
 VLLM_GROUP_PORT = 51216 
 
-# PHYSICAL GPU IDs
-PHYSICAL_SERVER_GPU = "0"   # vLLM
-PHYSICAL_TRAINER_GPU = "1"  # Trainer
-
-# Hyperparams
-NUM_TRAIN_STEPS = 10
+# Training Hyperparameters
+NUM_TRAIN_STEPS = 50
 BATCH_SIZE = 8       
 MAX_STEPS_PER_EPISODE = 9 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("orchestrator")
+logger = logging.getLogger("trainer")
 
 # ---------------------------------------------------------------------------
-# Process 1: vLLM Server
+# Setup
 # ---------------------------------------------------------------------------
 
-def launch_vllm_server():
-    """Launches vLLM as a subprocess strictly on Physical GPU 0, logging to a file."""
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = PHYSICAL_SERVER_GPU
-    env["VLLM_USE_V1"] = "1"
-    
-    # CRITICAL: Force unbuffered output so 'tail -f' updates immediately
-    env["PYTHONUNBUFFERED"] = "1" 
-    
-    cmd = [
-        sys.executable, "-u", "-m", "ludic.inference.vllm_server", # -u also ensures unbuffered
-        "--model", MODEL_NAME,
-        "--host", VLLM_HOST,
-        "--port", str(VLLM_PORT),
-        "--gpu-memory-utilization", "0.8", 
-        "--max-model-len", "2048",
-        "--enforce-eager",
-        "--enable-lora", "False" 
-    ]
-    
-    logger.info(f"🚀 [Main] Launching vLLM on Physical GPU {PHYSICAL_SERVER_GPU}...")
-    logger.info(f"📄 [Main] vLLM logs are being piped to 'vllm_server.log'")
-    
-    # Open the log file in write mode (overwrites previous logs)
-    # The file handle remains open for the subprocess
-    log_file = open("vllm_server.log", "w")
-
-    process = subprocess.Popen(
-        cmd, 
-        env=env,
-        stdout=log_file,         # Pipe stdout to file
-        stderr=subprocess.STDOUT # Pipe stderr to the same file (interleaved)
-    )
-    return process
-
-def wait_for_server(url: str, timeout: int = 120):
-    start = time.time()
-    logger.info("⏳ [Main] Waiting for vLLM health check...")
-    while time.time() - start < timeout:
+def wait_for_server(url: str):
+    logger.info(f"⏳ Waiting for vLLM at {url}...")
+    while True:
         try:
-            if requests.get(f"{url}/health", timeout=2).status_code == 200:
-                logger.info("✅ [Main] vLLM Server is ready.")
-                return True
+            if requests.get(f"{url}/health", timeout=1).status_code == 200:
+                logger.info("✅ vLLM Server is online.")
+                return
         except requests.RequestException:
             pass
         time.sleep(2)
-    return False
 
-# ---------------------------------------------------------------------------
-# Process 2: The Trainer
-# ---------------------------------------------------------------------------
+def main():
+    # 1. Device Setup
+    # We rely on the user setting CUDA_VISIBLE_DEVICES externally.
+    # So "cuda:0" here refers to whatever GPU this process is allowed to see.
+    if not torch.cuda.is_available():
+        logger.error("❌ No GPU found! Did you set CUDA_VISIBLE_DEVICES correctly?")
+        sys.exit(1)
+        
+    logger.info(f"🛡️ Trainer running on: {torch.cuda.get_device_name(0)}")
 
-def run_trainer_process():
-    """
-    This function runs in a completely separate process.
-    We can set CUDA_VISIBLE_DEVICES here safely before importing torch.
-    """
-    # 1. FORCE ISOLATION IMMEDIATELY
-    os.environ["CUDA_VISIBLE_DEVICES"] = PHYSICAL_TRAINER_GPU
-    
-    # 2. Late imports to ensure they see the restricted GPU environment
-    import torch
-    from transformers import AutoModelForCausalLM
-    from ludic.agent import Agent
-    from ludic.context.full_dialog import FullDialog
-    from ludic.inference.vllm_client import VLLMChatClient
-    from ludic.parsers import xml_move_parser
-    from ludic.training.rollout_engine import RolloutEngine, RolloutBatchSource, EnvRegistry, ProtocolRegistry
-    from ludic.training.algorithm import make_reinforce
-    from ludic.training.trainer import Trainer
-    from ludic.training.config import TrainerConfig
-    from ludic.interaction.single_agent import SingleAgentSyncProtocol
-    from ludic.distributed.adapters import create_vllm_publisher
-    from examples.envs.tic_tac_toe import TicTacToeEnv
+    # 2. Wait for vLLM (launched externally)
+    wait_for_server(f"http://{VLLM_HOST}:{VLLM_PORT}")
 
-    # Setup Logging for this process
-    t_logger = logging.getLogger("trainer")
-    t_logger.setLevel(logging.INFO)
-
-    if torch.cuda.is_available():
-        current_device = torch.cuda.current_device()
-        t_logger.info(f"🛡️ [Trainer] Process started. Visible GPU: {torch.cuda.get_device_name(current_device)}")
-        t_logger.info(f"   (This should match Physical GPU {PHYSICAL_TRAINER_GPU})")
-
-    # 3. Setup Client (Logical cuda:0 here is actually Physical GPU 1)
+    # 3. Setup Client
+    logger.info("🔗 Connecting Client...")
     client = VLLMChatClient(
         host=VLLM_HOST,
         port=VLLM_PORT,
@@ -129,14 +84,14 @@ def run_trainer_process():
     publisher = create_vllm_publisher(client)
 
     # 4. Load Model
-    t_logger.info("🧠 [Trainer] Loading model...")
+    logger.info("🧠 Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, 
         torch_dtype=torch.bfloat16, 
         trust_remote_code=True
     ).to("cuda:0")
 
-    # 5. Setup Components
+    # 5. Setup Engine
     env_registry = {"tictactoe": lambda **kwargs: TicTacToeEnv(**kwargs)}
     protocol_registry = {
         "single_agent": lambda: SingleAgentSyncProtocol(
@@ -150,6 +105,7 @@ def run_trainer_process():
         jsonl_path="training_rollouts.jsonl"
     )
 
+    # 6. Setup Batch Source
     def make_requests():
         sys_prompt = "You are playing Tic-Tac-Toe. Output your move as a single XML tag, e.g., <move>A1</move>."
         sampling_args = {
@@ -174,6 +130,7 @@ def run_trainer_process():
         retokenize=False 
     )
 
+    # 7. Trainer
     trainer = Trainer(
         model=model,
         algo=make_reinforce(gamma=0.99),
@@ -182,56 +139,16 @@ def run_trainer_process():
         cfg=TrainerConfig(model_device="cuda:0", lr=1e-6, grad_accum_steps=1, sync_every_steps=1)
     )
 
-    # 6. Train
-    t_logger.info("🏋️ [Trainer] Starting loop...")
+    # 8. Run
+    logger.info("🏋️ Starting Training...")
     trainer.train_sync(
         num_steps=NUM_TRAIN_STEPS,
         log_every=1,
-        log_fn=lambda stats: t_logger.info(
+        log_fn=lambda stats: logger.info(
             f"Step {stats['train_step']:.0f} | Loss: {stats['loss']:.4f} | Reward: {stats['avg_total_reward']:.2f}"
         )
     )
-    t_logger.info("🎉 [Trainer] Done!")
-
-# ---------------------------------------------------------------------------
-# Main Entrypoint
-# ---------------------------------------------------------------------------
-
-def main():
-    # Ensure multiprocessing uses 'spawn' to get fresh processes without inherited state
-    multiprocessing.set_start_method("spawn", force=True)
-
-    # 1. Launch vLLM
-    server_proc = launch_vllm_server()
-    
-    trainer_proc = None
-    try:
-        # 2. Wait for vLLM
-        if not wait_for_server(f"http://{VLLM_HOST}:{VLLM_PORT}"):
-            raise RuntimeError("vLLM server failed to start.")
-
-        # 3. Launch Trainer as a completely separate process
-        logger.info("🚀 [Main] Spawning Trainer process on GPU 1...")
-        trainer_proc = multiprocessing.Process(target=run_trainer_process)
-        trainer_proc.start()
-        
-        # Wait for trainer to finish
-        trainer_proc.join()
-        
-        if trainer_proc.exitcode != 0:
-            logger.error("❌ Trainer process exited with error.")
-        else:
-            logger.info("✅ Trainer process finished successfully.")
-
-    except KeyboardInterrupt:
-        logger.info("🛑 Interrupted by user.")
-    finally:
-        if trainer_proc and trainer_proc.is_alive():
-            trainer_proc.terminate()
-        if server_proc:
-            logger.info("🛑 Shutting down vLLM server...")
-            server_proc.terminate()
-            server_proc.wait()
+    logger.info("🎉 Done.")
 
 if __name__ == "__main__":
     main()
