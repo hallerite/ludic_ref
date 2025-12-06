@@ -24,7 +24,7 @@ class ChatClient(Protocol):
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         ...
 
-    def push_update_atomic(
+    def sync_weights(
         self,
         params: Mapping[str, torch.Tensor],
         *,

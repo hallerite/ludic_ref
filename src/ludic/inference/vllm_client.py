@@ -32,7 +32,7 @@ class VLLMChatClient(ChatClient):
             - Weight updates are disabled.
       * training/update mode (enable_weight_updates=True):
             - Client becomes an additional NCCL rank.
-            - Enables push_update_atomic() to broadcast updated parameters
+            - Enables sync_weights() to broadcast updated parameters
               directly into the vLLM worker processes.
 
     Args:
@@ -49,7 +49,7 @@ class VLLMChatClient(ChatClient):
             If the timeout is exceeded, the constructor raises ConnectionError.
         enable_weight_updates:
             If True, initialize the NCCL communicator and enable
-            push_update_atomic(); otherwise run in inference-only mode.
+            sync_weights(); otherwise run in inference-only mode.
         device:
             The device (e.g. "cuda:0", 0, or torch.device) to bind the NCCL
             communicator to. Defaults to 0. Important when running client on
@@ -214,9 +214,9 @@ class VLLMChatClient(ChatClient):
 
         return chat_resp, info
 
-    # ---- ChatClient.push_update_atomic --------------------------
+    # ---- ChatClient.sync_weights --------------------------
 
-    def push_update_atomic(
+    def sync_weights(
         self,
         params: Mapping[str, torch.Tensor],
         *,
@@ -240,7 +240,7 @@ class VLLMChatClient(ChatClient):
         if self._pynccl_comm is None or self._rank is None:
             if not self.enable_weight_updates:
                 raise RuntimeError(
-                    "push_update_atomic() called on inference-only client "
+                    "sync_weights() called on inference-only client "
                     "(enable_weight_updates=False)."
                 )
             raise RuntimeError("Communicator not initialized.")
@@ -294,7 +294,7 @@ class VLLMChatClient(ChatClient):
         self._pynccl_comm.group.barrier()
 
         if (time.time() - start) > timeout_s:
-            raise TimeoutError(f"push_update_atomic exceeded {timeout_s}s")
+            raise TimeoutError(f"sync_weights exceeded {timeout_s}s")
 
         # Note: The server-side /update_param_batch endpoint handles the
         # cache reset automatically at the end of the RPC call.

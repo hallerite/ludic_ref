@@ -433,8 +433,8 @@ async def run_server(args: Namespace) -> None:
         create_background_task(do_update_batch())
         return {"status": "ok"}
 
-    @app.post("/push_update_atomic")
-    async def push_update_atomic(request: Request) -> dict[str, Any]:
+    @app.post("/sync_weights")
+    async def sync_weights(request: Request) -> dict[str, Any]:
         """
         Optional batched update endpoint.
 

@@ -113,12 +113,12 @@ class Agent:
         version: Optional[str] = None,
     ) -> str:
         """Pushes updated policy parameters to the underlying runtime."""
-        if not hasattr(self._client, "push_update_atomic"):
+        if not hasattr(self._client, "sync_weights"):
             raise RuntimeError(
                 "Underlying ChatClient does not support policy weight updates "
-                "(missing push_update_atomic)."
+                "(missing sync_weights)."
             )
-        return self._client.push_update_atomic(
+        return self._client.sync_weights(
             params,
             timeout_s=timeout_s,
             reset_cache=reset_cache,
