@@ -35,25 +35,38 @@ logger = logging.getLogger("orchestrator")
 # ---------------------------------------------------------------------------
 
 def launch_vllm_server():
-    """Launches vLLM as a subprocess strictly on Physical GPU 0."""
+    """Launches vLLM as a subprocess strictly on Physical GPU 0, logging to a file."""
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = PHYSICAL_SERVER_GPU
-    env["VLLM_USE_V1"] = "1" 
+    env["VLLM_USE_V1"] = "1"
+    
+    # CRITICAL: Force unbuffered output so 'tail -f' updates immediately
+    env["PYTHONUNBUFFERED"] = "1" 
     
     cmd = [
-        sys.executable, "-m", "ludic.inference.vllm_server",
+        sys.executable, "-u", "-m", "ludic.inference.vllm_server", # -u also ensures unbuffered
         "--model", MODEL_NAME,
         "--host", VLLM_HOST,
         "--port", str(VLLM_PORT),
-        "--gpu-memory-utilization", "0.8", # vLLM gets 80% of GPU 0
+        "--gpu-memory-utilization", "0.8", 
         "--max-model-len", "2048",
         "--enforce-eager",
         "--enable-lora", "False" 
     ]
     
     logger.info(f"🚀 [Main] Launching vLLM on Physical GPU {PHYSICAL_SERVER_GPU}...")
-    # Redirect stdout/stderr to avoid clutter, or let them flow
-    process = subprocess.Popen(cmd, env=env)
+    logger.info(f"📄 [Main] vLLM logs are being piped to 'vllm_server.log'")
+    
+    # Open the log file in write mode (overwrites previous logs)
+    # The file handle remains open for the subprocess
+    log_file = open("vllm_server.log", "w")
+
+    process = subprocess.Popen(
+        cmd, 
+        env=env,
+        stdout=log_file,         # Pipe stdout to file
+        stderr=subprocess.STDOUT # Pipe stderr to the same file (interleaved)
+    )
     return process
 
 def wait_for_server(url: str, timeout: int = 120):
