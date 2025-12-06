@@ -38,8 +38,8 @@ VLLM_GROUP_PORT = 51216
 
 # Training Hyperparameters
 NUM_TRAIN_STEPS = 50
-BATCH_SIZE = 8       
-MAX_STEPS_PER_EPISODE = 9 
+BATCH_SIZE = 2       
+MAX_STEPS_PER_EPISODE = 5 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("trainer")

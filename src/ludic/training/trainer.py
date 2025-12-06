@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -18,6 +19,7 @@ from ludic.training.algorithm import RLAlgorithm
 from ludic.training.config import TrainerConfig
 from ludic.training.types import SAWBatch, SAWItem, BatchSource
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Collation: SAWItems -> tensor batch
@@ -232,11 +234,25 @@ class Trainer:
             saw_batch: SAWBatch = await self._batch_source.next_batch()
             all_saw_batches.append(saw_batch)
 
+            # Debug: Check batch size before collation to diagnose OOM
+            item_count = len(saw_batch.items)
+            logger.info(
+                f"[Micro-step {micro_step_idx+1}/{grad_accum_steps}] "
+                f"Received {item_count} SAWItems."
+            )
+
             # ---- 1b) Collate into tensors ------------------------------
             batch_tensors = _collate_saw_items(
                 saw_batch.items,
                 pad_token_id=self.cfg.pad_token_id,
                 device=device,
+            )
+
+            # Debug: Check tensor shape [Batch, Time]
+            input_shape = batch_tensors["input_ids"].shape
+            logger.info(
+                f"    -> Collated Tensor Shape: {input_shape} "
+                f"(Batch={input_shape[0]}, SeqLen={input_shape[1]})"
             )
 
             # ---- 1c) FSDP: context for no_sync -------------------------
