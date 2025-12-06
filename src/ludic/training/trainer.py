@@ -434,79 +434,95 @@ class Trainer:
         asyncio.run(self.train(num_steps, log_every=log_every, log_fn=log_fn))
 
     # ------------------------------------------------------------------
-    # Weight sync into runtime via Agent (FSDP-aware)
+    # Weight sync into runtime via Agent (FSDP-aware + LoRA-aware)
     # ------------------------------------------------------------------
 
     def _push_weights_to_runtime(self) -> None:
         """
         Gather weights (handling FSDP if needed) and publish them.
 
-        FSDP-aware behavior:
-
-            - If model is FSDP:
-                * only rank 0 (if dist initialized) does anything
-                * uses FULL_STATE_DICT with rank0_only=True
-                * gathers a full, unsharded state_dict on model_device
-                * optionally filters params, then hands the dict to Client
-
-            - If model is not FSDP:
-                * uses named_parameters() with the same filter policy.
-
-        Note: this assumes that the runtime (e.g. vLLM client) expects tensors
-        on the device implied by cfg.runtime_device (or cfg.model_device if None),
-        and will use NCCL from there. If you care, set cfg.runtime_device
-        accordingly.
+        If the model is a PEFT/LoRA model, we strictly follow the
+        Merge -> Publish -> Unmerge pattern so vLLM receives dense weights
+        but training continues on adapters.
         """
-        # Only rank 0 talks to the runtime in distributed mode
-        if dist.is_available() and dist.is_initialized():
-            if dist.get_rank() != 0:
+        # Helper to get the underlying model if wrapped in FSDP
+        # FSDP wraps the actual model in .module
+        inner_model = self.model.module if isinstance(self.model, FSDP) else self.model
+
+        # 1. Check if this is a LoRA/PEFT model
+        #    (We use getattr so we don't need to import peft here)
+        merge_fn = getattr(inner_model, "merge_adapter", None)
+        unmerge_fn = getattr(inner_model, "unmerge_adapter", None)
+        is_peft = callable(merge_fn) and callable(unmerge_fn)
+
+        # 2. If LoRA, merge weights before gathering
+        if is_peft:
+            merge_fn()
+
+        try:
+            # Only rank 0 talks to the runtime in distributed mode
+            if dist.is_available() and dist.is_initialized():
+                if dist.get_rank() != 0:
+                    return
+
+            runtime_device = torch.device(
+                self.cfg.runtime_device or self.cfg.model_device
+            )
+
+            # ---------------- FSDP path ----------------
+            if isinstance(self.model, FSDP):
+                # Gather full, unsharded state dict on the model device.
+                full_cfg = FullStateDictConfig(
+                    offload_to_cpu=False,
+                    rank0_only=True,
+                )
+                with FSDP.state_dict_type(
+                    self.model,
+                    StateDictType.FULL_STATE_DICT,
+                    full_cfg,
+                ):
+                    full_state = self.model.state_dict()
+
+                params: Dict[str, Tensor] = {}
+                for name, tensor in full_state.items():
+                    if self.param_filter is not None and not self.param_filter(name, tensor):
+                        continue
+                    # Detach and move to runtime device
+                    params[name] = tensor.detach().to(runtime_device)
+
+                if not params:
+                    return
+
+                self.publisher.publish(params)
                 return
 
-        runtime_device = torch.device(
-            self.cfg.runtime_device or self.cfg.model_device
-        )
-
-        # ---------------- FSDP path ----------------
-        if isinstance(self.model, FSDP):
-            # Gather full, unsharded state dict on the model device.
-            full_cfg = FullStateDictConfig(
-                offload_to_cpu=False,  # full model stays on GPU; rollouts dominate anyway
-                rank0_only=True,
-            )
-            with FSDP.state_dict_type(
-                self.model,
-                StateDictType.FULL_STATE_DICT,
-                full_cfg,
-            ):
-                full_state = self.model.state_dict()
-
+            # ---------------- non-FSDP path ----------------
             params: Dict[str, Tensor] = {}
-            for name, tensor in full_state.items():
-                if self.param_filter is not None and not self.param_filter(name, tensor):
-                    continue
-                # Important: The publisher handles the network transport,
-                # but we ensure tensors are on the correct device/detached first.
-                params[name] = tensor.detach().to(runtime_device)
+            for name, p in self.model.named_parameters():
+                if self.param_filter is not None:
+                    if not self.param_filter(name, p):
+                        continue
+                else:
+                    # In LoRA mode, non-adapter weights usually have requires_grad=False.
+                    # HOWEVER, because we just called merge_adapter(), the base weights
+                    # now theoretically contain the signal.
+                    # We publish everything that matches our requirements.
+
+                    # If standard training: send only requires_grad=True
+                    # If LoRA (merged): send everything (because base weights need updating in vLLM)
+                    if not is_peft and not p.requires_grad:
+                        continue
+
+                params[name] = p.detach().to(runtime_device)
 
             if not params:
                 return
 
             self.publisher.publish(params)
-            return
 
-        # ---------------- non-FSDP path ----------------
-        params: Dict[str, Tensor] = {}
-        for name, p in self.model.named_parameters():
-            if self.param_filter is not None:
-                if not self.param_filter(name, p):
-                    continue
-            else:
-                if not p.requires_grad:
-                    continue
-
-            params[name] = p.detach().to(runtime_device)
-
-        if not params:
-            return
-
-        self.publisher.publish(params)
+        finally:
+            # 3. CRITICAL: Unmerge adapters immediately after publishing.
+            #    If we don't do this, the optimizer state will become invalid
+            #    (gradients calculated on merged weights vs adapter weights).
+            if is_peft:
+                unmerge_fn()
