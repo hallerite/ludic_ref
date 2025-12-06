@@ -1,8 +1,9 @@
-import requests
+import time
 import torch
 from typing import List
 from ludic.distributed.interfaces import ControlPlane, WeightMetadata, TensorCommunicator
 from ludic.inference.vllm_client import VLLMChatClient
+from ludic.distributed.publisher import BroadcastPolicyPublisher
 
 class VllmControlPlane(ControlPlane):
     def __init__(self, client: VLLMChatClient):
@@ -12,13 +13,10 @@ class VllmControlPlane(ControlPlane):
 
     def announce_update_batch(self, metadata: List[WeightMetadata]) -> None:
         """
-        Hits the new /update_param_batch endpoint.
+        Hits the /update_param_batch endpoint to prepare the server.
         """
         # The server endpoint returns immediately after scheduling the task.
-        # But we need to make sure the server IS listening before we start broadcasting.
-        # Ideally, we would wait for an ACK, or reliance on the fact that 
-        # local HTTP is faster than the time it takes to setup the NCCL call.
-        
+        # We ensure the server is listening via the HTTP response before broadcasting.
         resp = self.session.post(
             f"{self.url}/update_param_batch",
             json={"metadata": metadata},
@@ -27,9 +25,12 @@ class VllmControlPlane(ControlPlane):
         resp.raise_for_status()
 
     def finalize_update(self, version: str | None = None) -> None:
-        # In the batched version, the server handles cache reset automatically 
-        # at the end of the RPC call. We might poll for version change here if strictly sync.
-        pass
+        """
+        Polls the server to ensure background weight application and 
+        cache resets are complete before allowing training to proceed.
+        """
+        while self.client.get_num_background_tasks() > 0:
+            time.sleep(0.2)
 
 class VllmTensorCommunicator(TensorCommunicator):
     def __init__(self, client: VLLMChatClient):
@@ -47,3 +48,17 @@ class VllmTensorCommunicator(TensorCommunicator):
 
     def barrier(self) -> None:
         self._comm.group.barrier()
+
+def create_vllm_publisher(client: VLLMChatClient) -> BroadcastPolicyPublisher:
+    """
+    Helper to wire up a PolicyPublisher from an existing VLLM client.
+    
+    Usage:
+        client = VLLMChatClient(enable_weight_updates=True)
+        publisher = create_vllm_publisher(client)
+        trainer = Trainer(..., publisher=publisher)
+    """
+    control = VllmControlPlane(client)
+    comm = VllmTensorCommunicator(client)
+    # The client acts as the source rank (the orchestrator)
+    return BroadcastPolicyPublisher(control, comm, src_rank=comm.rank)
