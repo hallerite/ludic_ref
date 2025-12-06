@@ -128,6 +128,7 @@ class Trainer:
         publisher: PolicyPublisher,
         cfg: TrainerConfig = TrainerConfig(),
         param_filter: Optional[Callable[[str, Tensor], bool]] = None,
+        enable_gradient_checkpointing: bool = False,
     ) -> None:
         """
         Args:
@@ -152,9 +153,11 @@ class Trainer:
 
             param_filter:
                 Optional predicate (name, Tensor) -> bool deciding which
-                parameters get pushed into the runtime. If None, defaults to
-                `p.requires_grad` for non-FSDP models; for FSDP, no default
-                filter (caller should pass one if they want to restrict).
+                parameters get pushed into the runtime.
+
+            enable_gradient_checkpointing:
+                If True, enables activation checkpointing on the model to save VRAM.
+                Also automatically disables KV cache and enables input gradients.
         """
         self.cfg = cfg
 
@@ -168,6 +171,29 @@ class Trainer:
         self.sync_every_steps = self.cfg.sync_every_steps
         self.param_filter = param_filter
         self._train_step_idx = 0
+
+        # ---- Gradient Checkpointing Setup ----------------------------
+        if enable_gradient_checkpointing:
+            logger.info("🛡️ Enabling Gradient Checkpointing (Activation Checkpointing)...")
+            
+            # 1. Enable on the model (HuggingFace standard API)
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            else:
+                logger.warning("⚠️ Model does not have 'gradient_checkpointing_enable' method.")
+
+            # 2. Disable KV Cache (incompatible with checkpointing + training)
+            if hasattr(self.model, "config"):
+                self.model.config.use_cache = False
+
+            # 3. Enable input gradients
+            # This is often required so that gradients can flow through the checkpointed segments.
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
+            else:
+                # Fallback for generic torch modules if needed, though usually HF specific
+                pass
+        # --------------------------------------------------------------
 
         # Initialize optimizer
         self.optimizer = self.initialize_optimizer()
