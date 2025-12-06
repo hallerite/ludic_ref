@@ -102,6 +102,25 @@ class WeightSyncWorkerExtension:
         # client rank is the last rank in the world (host process)
         self.client_rank = world_size - 1
 
+        # --- DEBUG: Print internal vLLM parameter names ---
+        # This executes on the worker process. We use Rank 0 to avoid duplicates.
+        if self.pynccl_comm.rank == 0:
+            print("\n" + "="*60)
+            print("🔍 [DEBUG] vLLM Internal Parameter Names (Worker Rank 0)")
+            print("="*60)
+            try:
+                # Access the underlying torch model
+                model_instance = self.model_runner.model
+                count = 0
+                for name, _ in model_instance.named_parameters():
+                    print(f"   • {name}")
+                    count += 1
+                print(f"Total parameters found: {count}")
+            except Exception as e:
+                print(f"⚠️ Could not print parameter names: {e}")
+            print("="*60 + "\n")
+        # --------------------------------------------------
+
     def update_named_param(self, name: str, dtype: str, shape: Sequence[int]) -> None:
         """
         Called via engine.collective_rpc on all workers.
