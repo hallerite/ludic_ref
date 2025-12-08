@@ -19,20 +19,29 @@ class Loss(Protocol):
     def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         ...
 
-
-def _check_shape_2d(name: str, t: Tensor) -> None:
-    if t.ndim != 2:
-        raise ValueError(f"{name} must be 2D [B, T], got shape {tuple(t.shape)}")
-
+# We define this as a standalone helper so torch.compile can cache it cleanly.
+# dynamic=True is critical for varying sequence lengths (preventing recompilation).
+@torch.compile(dynamic=True)
+def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
+    """
+    Fused kernel for log_softmax + gather.
+    
+    Inductor (torch.compile) generates a kernel that computes the log_softmax
+    normalization term and selects the target token in a single pass.
+    This avoids materializing the massive [B, T, V] probability tensor in VRAM.
+    """
+    # This looks naive, but the compiler fuses it into a single read/write op.
+    logprobs = logits.log_softmax(dim=-1)
+    return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
 
 def compute_logp_action(
-    logits: Tensor,
-    input_ids: Tensor,
-    action_mask: Tensor,
+    logits: Tensor, 
+    input_ids: Tensor, 
+    action_mask: Tensor
 ) -> Tensor:
     """
     Compute log π(a|s) given token-level logits and an action mask.
-
+    
     Args:
         logits: [B, T, V] float tensor of unnormalized logits.
         input_ids: [B, T] long tensor of token ids actually sampled.
@@ -43,29 +52,16 @@ def compute_logp_action(
     """
     if logits.ndim != 3:
         raise ValueError(f"Expected logits [B, T, V], got {tuple(logits.shape)}")
-    _check_shape_2d("input_ids", input_ids)
-    _check_shape_2d("action_mask", action_mask)
-
+    
     if input_ids.shape != logits.shape[:2]:
-        raise ValueError(
-            f"input_ids shape {tuple(input_ids.shape)} incompatible with logits "
-            f"shape {tuple(logits.shape)}"
-        )
-    if action_mask.shape != logits.shape[:2]:
-        raise ValueError(
-            f"action_mask shape {tuple(action_mask.shape)} incompatible with logits "
-            f"shape {tuple(logits.shape)}"
-        )
+        raise ValueError(f"Shape mismatch: input_ids {input_ids.shape} vs logits {logits.shape}")
 
-    # [B, T, V]
-    logprobs = torch.log_softmax(logits, dim=-1)
-
-    # Gather log-prob of the actual token at each position: [B, T]
-    token_logp = logprobs.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    # Use the compiled fused kernel
+    token_logp = selective_log_softmax(logits, input_ids)
 
     # Sum log-probs over the action region only: [B]
     amask = action_mask.to(token_logp.dtype)
-    logp_action = (token_logp * amask).sum(dim=1)
+    logp_action = (token_logp * amask).sum(dim=-1)
 
     return logp_action
 
