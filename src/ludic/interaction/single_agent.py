@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, List
 
 from ludic.envs.env import LudicEnv
 from ludic.agent import Agent
@@ -38,7 +38,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
         seed: Optional[int] = None,
         sampling_args: Optional[SamplingArgs] = None,
         timeout_s: Optional[float] = None,
-    ) -> Rollout:
+    ) -> List[Rollout]:
         
         agent = self.agent
         sargs: SamplingArgs = sampling_args or {}
@@ -67,10 +67,8 @@ class SingleAgentSyncProtocol(InteractionProtocol):
         agent.reset(system_prompt=sys_prompt)
         agent.on_env_reset(obs, info)
         
-        rollout = Rollout(meta={
-            "agent_name": getattr(agent, "name", "unknown"),
-            "env_name": env.__class__.__name__,
-        })
+        # Accumulate steps locally first
+        steps: List[Step] = []
 
         # 4. --- Run Interaction Loop ---
         for t in range(max_steps):
@@ -104,7 +102,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 )
                 
                 # Log this failure step
-                rollout.steps.append(Step(
+                steps.append(Step(
                     index=t,
                     prev_obs=current_obs_for_step,
                     action=raw_action,
@@ -151,7 +149,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 if not (outcome.terminated or outcome.truncated):
                     logged_next_obs = outcome.obs
                 
-                rollout.steps.append(Step(
+                steps.append(Step(
                     index=t,
                     prev_obs=current_obs_for_step,
                     action=raw_action,
@@ -172,4 +170,12 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 # Feed the new observation to the agent
                 agent.on_after_step(obs, info)
 
-        return rollout
+        rollout = Rollout(
+            steps=steps,
+            meta={
+                "agent_name": getattr(agent, "name", "unknown"),
+                "env_name": env.__class__.__name__,
+            }
+        )
+
+        return [rollout]

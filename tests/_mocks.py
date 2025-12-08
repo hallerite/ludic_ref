@@ -52,7 +52,7 @@ class MockAgent(Agent):
         super().__init__(client=client, model=model, ctx=ctx, parser=parser)
 
 
-# ---- NEW: Seedable Mock Client for GRPO Test ----
+# ---- Seedable Mock Client for GRPO Test ----
 
 class SeedableMockClient(ChatClient):
     """

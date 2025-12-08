@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import pytest
 
 from ludic.agent import Agent
 from ludic.inference.client import ChatResponse
+from ludic.interaction.base import InteractionProtocol
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.context.full_dialog import FullDialog
+from ludic.envs.env import LudicEnv
 from ludic.inference.sampling import SamplingConfig
 from ludic.training.rollout_engine import (
     RolloutEngine,
@@ -21,16 +23,15 @@ from ludic.training.types import (
     RolloutRequest,
 )
 from ludic.training.credit_assignment import MonteCarloReturn
-from ludic.types import Rollout
+from ludic.types import Rollout, SamplingArgs, Step
 
-from tests._mocks import MockClient, _mock_parser, MockAgent
+from tests._mocks import MockClient, _mock_parser, MockAgent, MockEnv
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 # ---------------------------------------------------------------------
 # Helper / local mocks
 # ---------------------------------------------------------------------
-
 
 class TokenClient(MockClient):
     """
@@ -44,6 +45,7 @@ class TokenClient(MockClient):
         model: str,
         messages: List[Dict[str, str]],
         sampling: SamplingConfig,
+        **kwargs,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         # Prompt is "some prompt", completion is "1".
         # Tokens are arbitrary but deterministic.
@@ -79,6 +81,26 @@ def fake_tokenize(text: str) -> List[int]:
     """
     return [ord(c) for c in text]
 
+# ---------------------------------------------------------------------
+# Mock Protocol that produces MULTIPLE rollouts per run()
+# ---------------------------------------------------------------------
+
+class MultiTraceMockProtocol(InteractionProtocol):
+    """A mock protocol that simulates 2 agents generating traces in 1 episode."""
+    async def run(
+        self,
+        *,
+        env: LudicEnv,
+        max_steps: int,
+        seed: Optional[int] = None,
+        sampling_args: Optional[SamplingArgs] = None,
+        timeout_s: Optional[float] = None,
+    ) -> List[Rollout]:
+        # Simulate Agent A
+        r1 = Rollout(steps=[Step(0, "obsA", "actA", "nextA", 1.0, False, True)])
+        # Simulate Agent B
+        r2 = Rollout(steps=[Step(0, "obsB", "actB", "nextB", -0.5, False, True)])
+        return [r1, r2]
 
 # ---------------------------------------------------------------------
 # generate_rollouts: env/ctx registry + metadata + concurrency
@@ -106,6 +128,7 @@ async def test_generate_rollouts_basic_metadata_and_termination(
         meta={"tag": "test"},
     )
 
+    # Calling with single-agent protocol, should get 2 rollouts (1 per episode)
     rollouts = await engine.generate_rollouts(
         requests=[request],
         max_steps=5,
@@ -137,6 +160,43 @@ async def test_generate_rollouts_basic_metadata_and_termination(
         seen_episode_idx.add(episode_idx)
 
     assert seen_episode_idx == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_generate_rollouts_flattens_multi_trace_protocols(
+    env_registry,
+) -> None:
+    """
+    Verifies that if a protocol returns [RolloutA, RolloutB] for one episode,
+    the engine correctly flattens them into the result list.
+    """
+    protocol_registry: ProtocolRegistry = {
+        "multi_trace": lambda: MultiTraceMockProtocol()
+    }
+    
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    request = RolloutRequest(
+        env=EnvSpec(kind="mock", kwargs={}),
+        protocol=ProtocolSpec(kind="multi_trace"),
+        num_episodes=2, # 2 Global Episodes
+    )
+
+    # 2 Episodes * 2 Traces per Episode = 4 Total Rollouts
+    rollouts = await engine.generate_rollouts(
+        requests=[request],
+        max_steps=5,
+    )
+
+    assert len(rollouts) == 4
+    
+    # Check that we have 2 from episode 0 and 2 from episode 1
+    ep_indices = [r.meta["episode_idx"] for r in rollouts]
+    assert ep_indices.count(0) == 2
+    assert ep_indices.count(1) == 2
 
 
 @pytest.mark.asyncio

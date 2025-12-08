@@ -102,7 +102,7 @@ class RolloutEngine:
         *,
         max_steps: int,
         timeout_s: Optional[float],
-    ) -> Rollout:
+    ) -> List[Rollout]:
         """
         Run a single rollout for a given RolloutRequest.
 
@@ -123,7 +123,8 @@ class RolloutEngine:
             is_forced_seed = request.seed is not None
 
             # 4. Run the episode using the fresh protocol and env
-            rollout = await protocol.run(
+            # Returns a LIST of rollouts (one per managed agent trace)
+            rollouts = await protocol.run(
                 env=env,
                 max_steps=max_steps,
                 seed=run_seed,
@@ -131,27 +132,28 @@ class RolloutEngine:
                 timeout_s=timeout_s,
             )
 
-            # 5. Log metadata
-            rollout.meta.setdefault("episode_idx", episode_idx)
-            rollout.meta.setdefault("request_meta", {})
-            rollout.meta["request_meta"].update(request.meta)
-            rollout.meta.setdefault("engine", {})
-            rollout.meta["engine"].update(
-                {
-                    "max_steps": max_steps,
-                    "timeout_s": timeout_s,
-                    "env_kind": request.env.kind,
-                    "protocol_kind": request.protocol.kind,
-                    "used_seed": run_seed,
-                    "forced_seed": is_forced_seed,
-                }
-            )
+            # 5. Log metadata for ALL returned rollouts
+            for r in rollouts:
+                r.meta.setdefault("episode_idx", episode_idx)
+                r.meta.setdefault("request_meta", {})
+                r.meta["request_meta"].update(request.meta)
+                r.meta.setdefault("engine", {})
+                r.meta["engine"].update(
+                    {
+                        "max_steps": max_steps,
+                        "timeout_s": timeout_s,
+                        "env_kind": request.env.kind,
+                        "protocol_kind": request.protocol.kind,
+                        "used_seed": run_seed,
+                        "forced_seed": is_forced_seed,
+                    }
+                )
 
-            if self.jsonl_path:
-                self._append_jsonl(rollout)
+                if self.jsonl_path:
+                    self._append_jsonl(r)
 
             # 6. The protocol and env go out of scope and are garbage collected
-            return rollout
+            return rollouts
 
     def _append_jsonl(self, rollout: Rollout) -> None:
         assert self.jsonl_path is not None
@@ -199,7 +201,7 @@ class RolloutEngine:
             return []
 
         sem = asyncio.Semaphore(max(1, concurrency))
-        tasks: List[asyncio.Task[Rollout]] = []
+        tasks: List[asyncio.Task[List[Rollout]]] = []
 
         global_idx = 0
         for req in requests:
@@ -217,7 +219,9 @@ class RolloutEngine:
                 )
                 global_idx += 1
 
-        return await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+        # Flatten the list of lists (one list per episode -> single flat list of rollouts)
+        return [r for sublist in results for r in sublist]
 
     # ---- SAW batch generation --------------------------------------------
 
@@ -351,6 +355,7 @@ class RolloutEngine:
                 )
 
         # ---- Build batch-level metadata -----------------------------------
+        # Note: batch_size now reflects total number of *agent trajectories*, not global episodes.
         meta = {
             "batch_size": len(rollouts),
             "total_items": len(items),

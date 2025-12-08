@@ -1,6 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, List
 
 from ludic.envs.env import LudicEnv
 from ludic.types import Rollout, SamplingArgs
@@ -22,7 +22,7 @@ class InteractionProtocol(ABC):
         seed: Optional[int] = None,
         sampling_args: Optional[SamplingArgs] = None,
         timeout_s: Optional[float] = None,
-    ) -> Rollout:
+    ) -> List[Rollout]:
         """
         Executes one full episode according to the protocol's rules
         and returns the complete Rollout.
