@@ -109,7 +109,6 @@ class Agent:
         params: Mapping[str, torch.Tensor],
         *,
         timeout_s: float = 600.0,
-        reset_cache: bool = True,
         version: Optional[str] = None,
     ) -> str:
         """Pushes updated policy parameters to the underlying runtime."""
@@ -121,6 +120,5 @@ class Agent:
         return self._client.sync_weights(
             params,
             timeout_s=timeout_s,
-            reset_cache=reset_cache,
             version=version,
         )
