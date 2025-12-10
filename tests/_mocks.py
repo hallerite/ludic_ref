@@ -9,7 +9,7 @@ from ludic.envs.single_agent_env import SingleAgentEnv
 from ludic.types import Message, StepOutcome, Observation, Info
 from ludic.inference.client import ChatResponse, ChatClient
 from ludic.inference.sampling import SamplingConfig
-from ludic.agent import Agent
+from ludic.agents.base_agent import Agent
 from ludic.context.base import ContextStrategy
 from ludic.context.full_dialog import FullDialog
 from ludic.parsers import Parser, ParseResult

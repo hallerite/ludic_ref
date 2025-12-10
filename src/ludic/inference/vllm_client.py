@@ -4,6 +4,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import requests
+import aiohttp
 import torch  # type: ignore
 from openai import AsyncOpenAI
 from requests import ConnectionError
@@ -98,6 +99,23 @@ class VLLMChatClient(ChatClient):
         if self.enable_weight_updates:
             self._init_communicator()
             atexit.register(self.close_communicator)
+
+    async def get_policy_version(self) -> int:
+        """
+        Polls the /runtime_version endpoint of the vLLM server to check
+        the current monotonic version of the policy weights.
+        """
+        url = f"{self.server_url}/runtime_version"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=2.0) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return int(data.get("version", 0))
+        except Exception:
+            # On failure (timeout/network), simply return 0 or log warning
+            pass
+        return 0
 
     # ---- ChatClient.complete ------------------------------------
 
@@ -221,8 +239,7 @@ class VLLMChatClient(ChatClient):
         params: Mapping[str, torch.Tensor],
         *,
         timeout_s: float = 600.0,
-        reset_cache: bool = True,
-        version: Optional[str] = None,
+        version: Optional[Union[str, int]] = None,
     ) -> str:
         """
         Push updated model parameters into the running vLLM server.
@@ -265,10 +282,16 @@ class VLLMChatClient(ChatClient):
 
         # 2. Control Plane: Announce Batch
         url = f"{self.server_url}/update_param_batch"
+        
+        # Prepare payload with optional version
+        payload = {"metadata": metadata}
+        if version is not None:
+            payload["version"] = version
+
         try:
             resp = self._session.post(
                 url,
-                json={"metadata": metadata},
+                json=payload,
                 timeout=timeout_s,
             )
         except Timeout:
@@ -296,19 +319,11 @@ class VLLMChatClient(ChatClient):
         if (time.time() - start) > timeout_s:
             raise TimeoutError(f"sync_weights exceeded {timeout_s}s")
 
-        # Note: The server-side /update_param_batch endpoint handles the
-        # cache reset automatically at the end of the RPC call.
-        if reset_cache:
-            # We can still call this explicitly if desired, or rely on server.
-            # Calling it again is harmless but adds a small RTT.
-            # For strict backward compat, we leave it, or we rely on the server side.
-            pass
-
         # Wait for server background weight-update tasks to drain
         while self.get_num_background_tasks() > 0:
             time.sleep(0.2)
 
-        return version or f"vllm-{int(time.time())}"
+        return str(version) if version is not None else f"vllm-{int(time.time())}"
 
     # ---- Control-plane helpers ---------------------------------
 

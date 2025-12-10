@@ -29,12 +29,22 @@ class ChatClient(Protocol):
         params: Mapping[str, torch.Tensor],
         *,
         timeout_s: float = 600.0,
-        reset_cache: bool = True,
-        version: Optional[str] = None,
+        version: Optional[str | int] = None,
     ) -> str:
         """
         Atomically apply a set of parameter updates.
         Returns the committed version string.
         Should raise specific exceptions on timeout/reject/broadcast failure.
+        """
+        ...
+
+class VersionedClient(ChatClient, Protocol):
+    """
+    A ChatClient that is also 'PipelineRL Ready'.
+    It can report the version of the policy currently serving requests.
+    """
+    async def get_policy_version(self) -> int:
+        """
+        Returns the current monotonic version of the policy weights.
         """
         ...

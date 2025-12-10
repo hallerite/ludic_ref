@@ -12,10 +12,10 @@ from ludic.training.types import (
     ProtocolSpec,
     EnvSpec,
 )
-from ludic.training.rollout_engine import (
+from ludic.training.batching import (
     RolloutEngine,
-    GRPOBatchSource,
-    ProtocolRegistry,
+    RolloutBatchSource,
+    GRPORequestStrategy,
 )
 from ludic.training.credit_assignment import (
     GroupNormalizedReturn,
@@ -87,7 +87,7 @@ class SeedableMockEnv(SingleAgentEnv):
 async def test_grpo_e2e_seed_grouping_and_credit() -> None:
     """
     Tests the full GRPO data pipeline:
-    1. GRPOBatchSource expands N requests to N*G.
+    1. GRPORequestStrategy expands N requests to N*G.
     2. RolloutEngine uses env_seed for reset() and sampling_seed for act().
     3. The Env is deterministic on env_seed (same obs).
     4. The *Mock* Agent is deterministic on sampling_seed (different actions).
@@ -129,7 +129,7 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
         return SingleAgentSyncProtocol(agent=agent)
     # -----------------------------------
     
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "grpo_protocol": create_protocol
     }
 
@@ -138,7 +138,8 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
         env_registry=env_registry,
     )
 
-    def make_base_requests() -> List[RolloutRequest]:
+    def make_expanded_requests() -> List[RolloutRequest]:
+        # 1. Define Base Requests
         s_args_A: SamplingArgs = {
             "temperature": 0.7,
             "max_tokens": 5,
@@ -164,13 +165,17 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
             seed=seed_group_B,  # Force env seed for Group B
             sampling_args=s_args_B,
         )
-        return [req_A, req_B]
+        
+        # 2. Expand using GRPO Strategy
+        strategy = GRPORequestStrategy(group_size=G_PER_GROUP)
+        return strategy.expand([req_A, req_B])
 
-    batch_source = GRPOBatchSource(
+    # NOTE: We use the STANDARD RolloutBatchSource, effectively injecting
+    # the GRPO logic via the expansion function above.
+    batch_source = RolloutBatchSource(
         orchestrator=engine,
         credit_assigner=credit_assigner,
-        requests_fn=make_base_requests,
-        group_size=G_PER_GROUP,
+        requests_fn=make_expanded_requests,
         max_steps=3,
         retokenize=False,
         tokenize=None,

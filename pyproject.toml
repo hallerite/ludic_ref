@@ -23,6 +23,10 @@ dev = [
     "pytest-asyncio>=1.2.0",
     "ruff>=0.14.5",
 ]
+pipelinerl = [
+    "aiohttp>=3.13.2",
+    "redis>=7.1.0",
+]
 
 [tool.pytest.ini_options]
 markers = [

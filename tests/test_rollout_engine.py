@@ -12,10 +12,10 @@ from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.context.full_dialog import FullDialog
 from ludic.envs.env import LudicEnv
 from ludic.inference.sampling import SamplingConfig
-from ludic.training.rollout_engine import (
+
+from ludic.training.batching import (
     RolloutEngine,
     RolloutBatchSource,
-    ProtocolRegistry,
 )
 from ludic.training.types import (
     EnvSpec,
@@ -25,7 +25,7 @@ from ludic.training.types import (
 from ludic.training.credit_assignment import MonteCarloReturn
 from ludic.types import Rollout, SamplingArgs, Step
 
-from tests._mocks import MockClient, _mock_parser, MockAgent, MockEnv
+from tests._mocks import MockClient, _mock_parser, MockAgent
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -170,7 +170,7 @@ async def test_generate_rollouts_flattens_multi_trace_protocols(
     Verifies that if a protocol returns [RolloutA, RolloutB] for one episode,
     the engine correctly flattens them into the result list.
     """
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "multi_trace": lambda: MultiTraceMockProtocol()
     }
     
@@ -204,7 +204,7 @@ async def test_generate_rollouts_unknown_env_raises(
     env_registry,
     mock_agent,
 ) -> None:
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
     }
     engine = RolloutEngine(
@@ -230,7 +230,7 @@ async def test_generate_rollouts_unknown_protocol_raises(
     env_registry,
 ) -> None:
     """Verifies that an unknown protocol kind raises a KeyError."""
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         # No protocols registered
     }
     engine = RolloutEngine(
@@ -266,7 +266,7 @@ async def test_generate_rollouts_heterogeneous_protocols(
     agent_B = MockAgent(client=MockClient(text="Agent B says hi"))
     protocol_B = SingleAgentSyncProtocol(agent=agent_B)
 
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "protocol_A": lambda: protocol_A,
         "protocol_B": lambda: protocol_B,
     }
@@ -318,7 +318,7 @@ async def test_generate_rollouts_writes_jsonl(
 ) -> None:
     jsonl_path = tmp_path / "rollouts.jsonl"
     
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
     }
 
@@ -374,7 +374,7 @@ async def test_generate_batch_uses_model_token_ids_when_available(
         parser=_mock_parser
     )
     
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "token_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
     }
 
@@ -431,7 +431,7 @@ async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
     env_registry,
     mock_agent,
 ) -> None:
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
     }
     
@@ -464,7 +464,7 @@ async def test_generate_batch_retokenize_path_uses_custom_tokenizer(
     env_registry,
     mock_agent,
 ) -> None:
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
     }
     
@@ -526,7 +526,7 @@ async def test_rollout_batch_source_next_batch_integration(
     env_registry,
     mock_agent,
 ) -> None:
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
     }
     

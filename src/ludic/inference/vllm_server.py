@@ -432,6 +432,9 @@ async def run_server(args: Namespace) -> None:
         """
         data = await request.json()
         metadata = data.get("metadata", [])  # List of {name, dtype, shape}
+        
+        # Check if an explicit version was provided by the Trainer
+        forced_version = data.get("version")
 
         # Convert dicts to tuples for RPC serialization safety
         # (name, dtype, shape)
@@ -445,9 +448,13 @@ async def run_server(args: Namespace) -> None:
 
                 # Reset cache and bump version after full batch
                 await engine.reset_prefix_cache()
+                
                 global RUNTIME_VERSION
                 async with RUNTIME_VERSION_LOCK:
-                    RUNTIME_VERSION += 1
+                    if forced_version is not None:
+                        RUNTIME_VERSION = int(forced_version)
+                    else:
+                        RUNTIME_VERSION += 1
 
         create_background_task(do_update_batch())
         return {"status": "ok"}
@@ -478,9 +485,17 @@ async def run_server(args: Namespace) -> None:
                     await engine.collective_rpc(
                         "update_named_param", args=(name, dtype, shape)
                     )
+                
                 global RUNTIME_VERSION
                 async with RUNTIME_VERSION_LOCK:
-                    RUNTIME_VERSION += 1
+                    if requested_version is not None:
+                        try:
+                            RUNTIME_VERSION = int(requested_version)
+                        except ValueError:
+                            # If version is a string (e.g. "v1"), just increment
+                            RUNTIME_VERSION += 1
+                    else:
+                        RUNTIME_VERSION += 1
 
         create_background_task(do_update())
         return {"status": "ok", "requested_version": requested_version}

@@ -21,9 +21,14 @@ from tests._mocks import MockEnv, MockAgent
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def vllm_server() -> Tuple[str, int]:
+def vllm_server(request) -> Tuple[str, int]:
     host = os.getenv("VLLM_HOST", "127.0.0.1")
     port = int(os.getenv("VLLM_PORT", "8000"))
+
+    # Check if the test requested specific configuration (e.g. tools enabled)
+    # via @pytest.mark.parametrize("vllm_server", [{"enable_tools": True}], indirect=True)
+    config = getattr(request, "param", {})
+    enable_tools = config.get("enable_tools", False)
 
     env = os.environ.copy()
     env.setdefault("VLLM_USE_V1", "1")
@@ -49,6 +54,12 @@ def vllm_server() -> Tuple[str, int]:
         "4096",
         "--enforce-eager",
     ]
+
+    if enable_tools:
+        cmd.extend([
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "hermes",
+        ])
 
     proc = subprocess.Popen(
         cmd,

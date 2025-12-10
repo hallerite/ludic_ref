@@ -256,15 +256,42 @@ class Trainer:
         self.model.train()
 
         for micro_step_idx in range(grad_accum_steps):
-            # ---- 1a) Sample micro-batch --------------------------------
-            saw_batch: SAWBatch = await self._batch_source.next_batch()
+            
+            # ---- 1a) Sample Valid Micro-batch (with Rejection Loop) ----
+            # For PipelineRL, we might receive stale data from the queue.
+            # We loop until we get a batch containing at least one fresh item.
+            while True:
+                saw_batch: SAWBatch = await self._batch_source.next_batch()
+                
+                # If configured, filter out items that exceed max_lag.
+                if self.cfg.max_lag is not None:
+                    current_time = self._train_step_idx
+                    limit = self.cfg.max_lag
+                    
+                    fresh_items = []
+                    for item in saw_batch.items:
+                        # Default to current_time (0 lag) if tag is missing
+                        item_ver = item.meta.get("policy_version", current_time)
+                        if (current_time - item_ver) <= limit:
+                            fresh_items.append(item)
+                    
+                    # Update the batch with only fresh items
+                    saw_batch.items = fresh_items
+
+                # If the batch is empty (e.g. all stale), drop it and fetch another.
+                if not saw_batch.items:
+                    continue
+
+                # Batch has valid items, proceed to collation
+                break
+
             all_saw_batches.append(saw_batch)
 
-            # Debug: Check batch size before collation to diagnose OOM
+            # Debug: Check batch size before collation to diagnose OOM or filtering impact
             item_count = len(saw_batch.items)
             logger.info(
                 f"[Micro-step {micro_step_idx+1}/{grad_accum_steps}] "
-                f"Received {item_count} SAWItems."
+                f"Processing {item_count} SAWItems."
             )
 
             # ---- 1b) Collate into tensors ------------------------------
@@ -496,6 +523,9 @@ class Trainer:
                 self.cfg.runtime_device or self.cfg.model_device
             )
 
+            # We use the current training step as the authoritative version for PipelineRL
+            current_version = self._train_step_idx
+
             # --- Helpers to clean/filter keys for vLLM ---
             def should_publish(k: str) -> bool:
                 # Filter out pure adapter weights (lora_A, lora_B, etc.)
@@ -538,7 +568,7 @@ class Trainer:
                 if not params:
                     return
 
-                self.publisher.publish(params)
+                self.publisher.publish(params, version=current_version)
                 return
 
             # ---------------- non-FSDP path ----------------
@@ -567,7 +597,7 @@ class Trainer:
             if not params:
                 return
 
-            self.publisher.publish(params)
+            self.publisher.publish(params, version=current_version)
 
         finally:
             # 3. CRITICAL: Unmerge adapters immediately after publishing.

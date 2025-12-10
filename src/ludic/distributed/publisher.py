@@ -1,5 +1,5 @@
 import torch
-from typing import Mapping, List
+from typing import Mapping, List, Optional
 from ludic.distributed.interfaces import (
     PolicyPublisher, 
     ControlPlane, 
@@ -23,7 +23,7 @@ class BroadcastPolicyPublisher(PolicyPublisher):
         self.comm = comm
         self.src_rank = src_rank
 
-    def publish(self, state_dict: Mapping[str, torch.Tensor]) -> None:
+    def publish(self, state_dict: Mapping[str, torch.Tensor], version: Optional[int] = None) -> None:
         # 1. Prepare Metadata
         metadata: List[WeightMetadata] = []
         # We need a stable order for the loop
@@ -39,7 +39,8 @@ class BroadcastPolicyPublisher(PolicyPublisher):
 
         # 2. Control Plane: Announce the Batch
         # This tells the server: "Allocate these tensors and get ready to receive"
-        self.control.announce_update_batch(metadata)
+        # We pass the version here so the server knows what "time" it is.
+        self.control.announce_update_batch(metadata, version=version)
 
         # 3. Data Plane: Stream Tensors
         # The server is now in a loop waiting for broadcast calls matching the metadata list

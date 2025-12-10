@@ -1,11 +1,12 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from ludic.types import Message, Observation, Info, ChatResponse
 
 class ContextStrategy(ABC):
     """
     Owns the chat transcript & how it's exposed to the agent at each step.
+    Natively supports System, User, Assistant, and Tool messages.
     """
 
     def __init__(self, system_prompt: Optional[str] = None) -> None:
@@ -42,6 +43,17 @@ class ContextStrategy(ABC):
         if prompt_to_use:
             self._messages.append({"role": "system", "content": prompt_to_use})
 
+    # ---- capabilities ---------------------------------------------------
+    @property
+    def supports_tools(self) -> bool:
+        """
+        Does this context strategy support tool_calls and tool messages?
+        
+        Defaults to True for the base class since _messages is a standard list.
+        Subclasses can override this to False if they strictly forbid it.
+        """
+        return True
+
     # ---- event hooks ----------------------------------------------------
     @abstractmethod
     def on_env_reset(self, obs: Observation, info: Info) -> None:
@@ -58,6 +70,32 @@ class ContextStrategy(ABC):
     @abstractmethod
     def on_after_step(self, next_obs: Observation, info: Info) -> None:
         """Record the new observation (usually as a user message)."""
+
+    # ---- tool hooks (native support) ------------------------------------
+    
+    def add_assistant_step(self, content: Optional[str], tool_calls: Optional[List[Dict[str, Any]]]) -> None:
+        """
+        Record an assistant turn that might contain thoughts (content) AND/OR tool calls.
+        This is used by agents (like ReActAgent) that perform intermediate reasoning steps.
+        """
+        msg = {"role": "assistant"}
+        if content:
+            msg["content"] = content
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        self._messages.append(msg)
+
+    def add_tool_result(self, tool_call_id: str, tool_name: str, result: str) -> None:
+        """
+        Record the output of a tool execution.
+        Standard format for OpenAI/vLLM tool interactions.
+        """
+        self._messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": result
+        })
 
     # ---- convenience ----------------------------------------------------
     @property

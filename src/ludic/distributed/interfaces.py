@@ -1,4 +1,4 @@
-from typing import Protocol, Mapping, List, TypedDict, runtime_checkable
+from typing import Protocol, Mapping, List, TypedDict, runtime_checkable, Optional
 import torch
 
 @runtime_checkable
@@ -32,10 +32,14 @@ class ControlPlane(Protocol):
     The Control Plane: Signals the runtime to prepare for updates.
     Implementations: VllmControlPlane (HTTP), RayControlPlane (RPC).
     """
-    def announce_update_batch(self, metadata: List[WeightMetadata]) -> None:
+    def announce_update_batch(self, metadata: List[WeightMetadata], version: Optional[int] = None) -> None:
         """
         Send ONE batch request containing metadata for all params to be updated.
         The runtime should prepare empty tensors and wait for NCCL broadcast.
+        
+        Args:
+            metadata: List of tensor specs.
+            version: Optional explicit version number to set on the runtime.
         """
         ...
     
@@ -48,8 +52,12 @@ class PolicyPublisher(Protocol):
     """
     The Orchestrator: The only thing the Trainer talks to.
     """
-    def publish(self, state_dict: Mapping[str, torch.Tensor]) -> None:
+    def publish(self, state_dict: Mapping[str, torch.Tensor], version: Optional[int] = None) -> None:
         """
         Publishes the state_dict to the remote inference engine.
+        
+        Args:
+            state_dict: The model parameters to push.
+            version: Optional explicit version number (clock) for PipelineRL.
         """
         ...

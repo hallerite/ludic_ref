@@ -1,6 +1,6 @@
 import time
 import torch
-from typing import List
+from typing import List, Optional
 from ludic.distributed.interfaces import ControlPlane, WeightMetadata, TensorCommunicator
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.distributed.publisher import BroadcastPolicyPublisher
@@ -11,15 +11,19 @@ class VllmControlPlane(ControlPlane):
         self.session = client._session
         self.url = client.server_url
 
-    def announce_update_batch(self, metadata: List[WeightMetadata]) -> None:
+    def announce_update_batch(self, metadata: List[WeightMetadata], version: Optional[int] = None) -> None:
         """
         Hits the /update_param_batch endpoint to prepare the server.
         """
+        payload = {"metadata": metadata}
+        if version is not None:
+            payload["version"] = version
+
         # The server endpoint returns immediately after scheduling the task.
         # We ensure the server is listening via the HTTP response before broadcasting.
         resp = self.session.post(
             f"{self.url}/update_param_batch",
-            json={"metadata": metadata},
+            json=payload,
             timeout=30.0
         )
         resp.raise_for_status()
