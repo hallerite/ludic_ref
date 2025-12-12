@@ -621,10 +621,10 @@ class Trainer:
             merge_fn()
 
         try:
-            # Only rank 0 talks to the runtime in distributed mode
-            if dist.is_available() and dist.is_initialized():
-                if dist.get_rank() != 0:
-                    return
+            rank = 0
+            is_distributed = dist.is_available() and dist.is_initialized()
+            if is_distributed:
+                rank = dist.get_rank()
 
             runtime_device = torch.device(
                 self.cfg.runtime_device or self.cfg.model_device
@@ -637,19 +637,27 @@ class Trainer:
 
             # --- Gather Raw Params (FSDP2 or Standard) ---
             if isinstance(self.model, fsdp.FSDPModule):
+                # DCP full_state_dict gathering is collective; all ranks must participate.
+                # Use cpu_offload=True to avoid materializing a full copy on every rank.
                 options = StateDictOptions(
                     full_state_dict=True,
-                    cpu_offload=(runtime_device.type == "cpu"),
+                    cpu_offload=True,
                 )
                 full_state = get_model_state_dict(
                     model=self.model,
                     options=options,
                 )
+                if is_distributed and rank != 0:
+                    return
                 for k, v in full_state.items():
                     if self.param_filter is not None and not self.param_filter(k, v):
                         continue
                     raw_params[k] = v.detach().to(runtime_device)
             else:
+                # Only rank 0 talks to the runtime in distributed mode
+                if is_distributed and rank != 0:
+                    return
+
                 # Standard model
                 for name, p in self.model.named_parameters():
                     # Optimization: In LoRA, only send what we touched (plus what needs fusion)

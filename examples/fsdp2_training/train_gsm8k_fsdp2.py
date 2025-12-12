@@ -45,6 +45,11 @@ from ludic.training.stats import Reducer
 from ludic.training.loggers import RichLiveLogger
 
 
+class _NoopPublisher:
+    def publish(self, state_dict, version=None) -> None:  # type: ignore[no-untyped-def]
+        return
+
+
 def init_dist() -> int:
     if dist.is_initialized():
         return dist.get_rank()
@@ -125,9 +130,13 @@ def main() -> None:
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
 
+    # Avoid multiple ranks writing to the same file.
+    rollout_log_path = args.rollout_log.replace(".jsonl", f".rank{rank}.jsonl")
+
     if rank == 0:
-        os.makedirs(os.path.dirname(args.rollout_log) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
         os.makedirs(args.checkpoint_dir, exist_ok=True)
+    dist.barrier()
 
     # Data
     all_train_samples = load_gsm8k(args.split, args.limit)
@@ -156,11 +165,26 @@ def main() -> None:
         device_map={"": "cpu"},
         low_cpu_mem_usage=True,
     )
+    # Shard transformer blocks first (recommended) then shard the root model.
+    blocks = None
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        blocks = model.model.layers  # type: ignore[attr-defined]
+    elif hasattr(model, "layers"):
+        blocks = model.layers  # type: ignore[attr-defined]
+    if blocks is not None:
+        for layer in blocks:
+            fsdp.fully_shard(layer, mp_policy=mp_policy)
     fsdp.fully_shard(model, mp_policy=mp_policy)
 
     # Shared client for inference
-    client = VLLMChatClient(host=args.vllm_host, port=args.vllm_port, enable_weight_updates=True)
-    publisher = create_vllm_publisher(client)
+    # Only rank0 should enable NCCL-based weight updates into vLLM.
+    client = VLLMChatClient(
+        host=args.vllm_host,
+        port=args.vllm_port,
+        enable_weight_updates=(rank == 0),
+        device=str(device),
+    )
+    publisher = create_vllm_publisher(client) if rank == 0 else _NoopPublisher()
 
     env_registry = {"gsm8k": lambda sample: GSM8KEnv(sample=sample, system_prompt=args.system_prompt)}
 
@@ -185,7 +209,7 @@ def main() -> None:
     engine = RolloutEngine(
         env_registry=env_registry,
         protocol_registry=protocol_registry,
-        jsonl_path=args.rollout_log,
+        jsonl_path=rollout_log_path,
     )
     sampling_args = {
         "temperature": args.train_temperature,

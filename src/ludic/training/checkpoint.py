@@ -15,6 +15,8 @@ from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     set_model_state_dict,
     StateDictOptions,
+    get_optimizer_state_dict,
+    set_optimizer_state_dict,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,26 +92,35 @@ class CheckpointManager:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Path]:
         """
-        Force a checkpoint save. Only the primary rank writes to disk.
+        Force a checkpoint save. All ranks participate in state_dict collection;
+        only the primary rank writes to disk.
         """
-        if not self._is_primary_rank():
-            return None
+        is_primary = self._is_primary_rank()
 
         ckpt_dir = self.base_dir / f"step_{step:06d}"
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if is_primary:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
         state_dict = self._gather_state_dict(model)
-        self._save_model(model, ckpt_dir, state_dict)
+        if is_primary:
+            self._save_model(model, ckpt_dir, state_dict)
 
         if optimizer is not None and self.cfg.save_optimizer:
-            torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+            optim_state = self._gather_optimizer_state_dict(model, optimizer)
+            if is_primary:
+                torch.save(optim_state, ckpt_dir / "optimizer.pt")
 
-        self._write_metadata(ckpt_dir, step, metadata)
-        self._write_latest_pointer(step)
-        self._prune_old_checkpoints()
+        if is_primary:
+            self._write_metadata(ckpt_dir, step, metadata)
+            self._write_latest_pointer(step)
+            self._prune_old_checkpoints()
 
-        logger.info("💾 Saved checkpoint: %s", ckpt_dir)
-        return ckpt_dir
+        if is_primary:
+            logger.info("💾 Saved checkpoint: %s", ckpt_dir)
+            return ckpt_dir
+        return None
 
     def load(
         self,
@@ -137,8 +148,12 @@ class CheckpointManager:
 
         metadata = self._load_model(model, ckpt_dir)
         if optimizer is not None and (ckpt_dir / "optimizer.pt").exists():
-            optim_state = torch.load(ckpt_dir / "optimizer.pt", map_location="cpu")
-            optimizer.load_state_dict(optim_state)
+            optim_state: Dict[str, Any] | None
+            if self._is_primary_rank():
+                optim_state = torch.load(ckpt_dir / "optimizer.pt", map_location="cpu")
+            else:
+                optim_state = None
+            self._load_optimizer_state_dict(model, optimizer, optim_state)
         return metadata
 
     # ------------------------------------------------------------------
@@ -164,6 +179,55 @@ class CheckpointManager:
 
         # Non-FSDP path
         return model.state_dict()
+
+    def _gather_optimizer_state_dict(
+        self,
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+    ) -> Dict[str, Any]:
+        """
+        Return an optimizer state dict suitable for saving alongside model weights.
+        """
+        if isinstance(model, fsdp.FSDPModule):
+            options = StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+                broadcast_from_rank0=True,
+            )
+            return get_optimizer_state_dict(
+                model=model,
+                optimizers=optimizer,
+                options=options,
+            )
+        return optimizer.state_dict()
+
+    def _load_optimizer_state_dict(
+        self,
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+        optim_state: Optional[Dict[str, Any]],
+    ) -> None:
+        """
+        Load an optimizer state dict into `optimizer`.
+
+        For FSDP2, rank0 reads the full optimizer state dict and broadcasts it
+        to other ranks, which shard it locally.
+        """
+        if isinstance(model, fsdp.FSDPModule):
+            set_optimizer_state_dict(
+                model=model,
+                optimizers=optimizer,
+                optim_state_dict=optim_state or {},
+                options=StateDictOptions(
+                    full_state_dict=True,
+                    broadcast_from_rank0=True,
+                ),
+            )
+            return
+
+        if optim_state is None:
+            return
+        optimizer.load_state_dict(optim_state)
 
     def _save_model(
         self,

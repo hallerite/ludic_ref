@@ -16,7 +16,7 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
    CUDA_VISIBLE_DEVICES=0 uv run python -m ludic.inference.vllm_server \
      --model Qwen/Qwen2.5-7B-Instruct \
      --port 8000 \
-     --concurrency 32
+     --max-num-seqs 32
    ```
 
 2. Launch training on GPUs 1–3:
@@ -33,7 +33,7 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
 
 3. Checkpoints and logs:
    - Checkpoints: `checkpoints_gsm8k_fsdp2/` (rank0 saves).
-   - Rollout log: `fsdp2_gsm8k_rollouts.jsonl`.
+   - Rollout logs: `fsdp2_gsm8k_rollouts.rank{RANK}.jsonl`.
    - Rank0 prints basic stats; attach `RichLiveLogger` only on rank0.
 
 ## Notes
