@@ -52,6 +52,45 @@ class _NoopPublisher:
         return
 
 
+async def run_eval(
+    *,
+    samples: List[Dict[str, Any]],
+    client: VLLMChatClient,
+    model: str,
+    system_prompt: str | None,
+    concurrency: int,
+    max_tokens: int,
+    temperature: float,
+) -> float:
+    """
+    Simple eval loop: run each sample once and report accuracy (% correct).
+    """
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _run_one(sample: Dict[str, Any]) -> bool:
+        async with sem:
+            env = GSM8KEnv(sample=sample, system_prompt=system_prompt)
+            protocol = SingleAgentSyncProtocol(
+                agent=Agent(
+                    client=client,
+                    model=model,
+                    ctx=FullDialog(),
+                    parser=boxed_parser,
+                )
+            )
+            rollouts = await protocol.run(
+                env=env,
+                max_steps=1,
+                sampling_args={"temperature": temperature, "max_tokens": max_tokens},
+            )
+            info = rollouts[0].steps[-1].info
+            return bool(info.get("correct"))
+
+    results = await asyncio.gather(*[_run_one(s) for s in samples])
+    correct = sum(1 for r in results if r)
+    return 100.0 * correct / len(samples) if samples else 0.0
+
+
 def configure_logging(*, rank: int, level: str) -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
@@ -139,15 +178,23 @@ def main() -> None:
     parser.add_argument("--vllm-host", default="127.0.0.1")
     parser.add_argument("--vllm-port", type=int, default=8000)
     parser.add_argument("--split", default="train")
-    parser.add_argument("--limit", type=int, default=256)
+    parser.add_argument("--limit", type=int, default=2048)
     parser.add_argument("--train-steps", type=int, default=50)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--concurrency", type=int, default=4)
+    # With 3 training ranks, 11 -> ~33 total in-flight rollouts hitting vLLM,
+    # which tends to saturate a --max-num-seqs 32 server without overdoing it.
+    parser.add_argument("--concurrency", type=int, default=11)
     parser.add_argument("--train-temperature", type=float, default=1.0)
     parser.add_argument("--system-prompt", type=str, default="")
     parser.add_argument("--rollout-log", type=str, default="fsdp2_gsm8k_rollouts.jsonl")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_gsm8k_fsdp2")
+    parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps (0 disables).")
+    parser.add_argument("--eval-before-start", action="store_true", default=False, help="Run eval once at step 0.")
+    parser.add_argument("--eval-limit", type=int, default=100, help="Number of test samples for eval (0 disables).")
+    parser.add_argument("--eval-concurrency", type=int, default=32)
+    parser.add_argument("--eval-temperature", type=float, default=0.0)
+    parser.add_argument("--eval-max-tokens", type=int, default=512)
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--logger", choices=["rich", "print", "none"], default="rich")
     args = parser.parse_args()
@@ -176,6 +223,10 @@ def main() -> None:
     train_samples = shard_samples(all_train_samples, rank, world_size)
     if not train_samples:
         raise SystemExit(f"Rank {rank}: no samples after sharding.")
+
+    eval_samples: List[Dict[str, Any]] = []
+    if rank == 0 and args.eval_limit and args.eval_limit > 0:
+        eval_samples = load_gsm8k("test", args.eval_limit)
 
     samples_q: queue.Queue = queue.Queue()
     for idx, s in enumerate(train_samples):
@@ -330,9 +381,33 @@ def main() -> None:
     )
 
     async def train_loop():
+        if args.eval_before_start and eval_samples:
+            if rank == 0:
+                acc = await run_eval(
+                    samples=eval_samples,
+                    client=client,
+                    model=args.model,
+                    system_prompt=args.system_prompt,
+                    concurrency=args.eval_concurrency,
+                    max_tokens=args.eval_max_tokens,
+                    temperature=args.eval_temperature,
+                )
+                print(f"[eval @ step 0] accuracy={acc:.2f}% on {len(eval_samples)} samples", flush=True)
+            if dist.is_initialized():
+                dist.barrier()
+
         for _ in range(args.train_steps):
-            if samples_q.empty():
-                break
+            # Stop all ranks if any rank runs out of samples to avoid deadlocks.
+            local_done = 1 if samples_q.empty() else 0
+            if dist.is_initialized():
+                done = torch.tensor(local_done, device=device)
+                dist.all_reduce(done, op=dist.ReduceOp.MAX)
+                if int(done.item()) != 0:
+                    break
+            else:
+                if local_done:
+                    break
+
             stats = await trainer.train_step()
             if rank == 0:
                 step = int(stats["train_step"])
@@ -340,6 +415,28 @@ def main() -> None:
                     f"[rank0 step {step}] loss={stats.get('loss'):.4f} reward={stats.get('avg_total_reward'):.4f}",
                     flush=True,
                 )
+
+            if args.eval_every and args.eval_every > 0 and eval_samples:
+                step = int(stats["train_step"])
+                if step % args.eval_every == 0:
+                    if dist.is_initialized():
+                        dist.barrier()
+                    if rank == 0:
+                        acc = await run_eval(
+                            samples=eval_samples,
+                            client=client,
+                            model=args.model,
+                            system_prompt=args.system_prompt,
+                            concurrency=args.eval_concurrency,
+                            max_tokens=args.eval_max_tokens,
+                            temperature=args.eval_temperature,
+                        )
+                        print(
+                            f"[eval @ step {step}] accuracy={acc:.2f}% on {len(eval_samples)} samples",
+                            flush=True,
+                        )
+                    if dist.is_initialized():
+                        dist.barrier()
 
     asyncio.run(train_loop())
 

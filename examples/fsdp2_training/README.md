@@ -20,6 +20,7 @@ bash examples/fsdp2_training/run_example.sh
    ```bash
    CUDA_VISIBLE_DEVICES=0 uv run python -m ludic.inference.vllm_server \
      --model Qwen/Qwen2.5-7B-Instruct \
+     --gpu_memory_utilization 0.8 \
      --port 8000 \
      --max-num-seqs 32
    ```
@@ -29,16 +30,16 @@ bash examples/fsdp2_training/run_example.sh
    # Pin training to GPUs 1,2,3 so GPU0 stays free for vLLM
    CUDA_VISIBLE_DEVICES=1,2,3 PYTHONPATH=. PYTHONUNBUFFERED=1 uv run torchrun --nproc_per_node=3 \
      examples/fsdp2_training/train_gsm8k_fsdp2.py \
-       --model Qwen/Qwen2.5-7B-Instruct \
-       --vllm-host 127.0.0.1 \
-       --vllm-port 8000 \
-       --limit 256 \
-       --train-steps 50 \
-       --concurrency 4 \
-       --batch-size 1 \
-       --group-size 8 \
-       --log-level INFO \
-       --logger print
+     --model Qwen/Qwen2.5-7B-Instruct \
+     --vllm-host 127.0.0.1 \
+     --vllm-port 8000 \
+     --limit 2048 \
+     --train-steps 50 --group-size 8 \
+     --concurrency 11 --batch-size 1 --train-temperature 1.0 \
+     --eval-before-start --eval-every 10 --eval-limit 100 \
+     --eval-concurrency 32 --eval-temperature 0.0 \
+     --log-level INFO \
+     --logger print
    ```
 
 3. Checkpoints and logs:

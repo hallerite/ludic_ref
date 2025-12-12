@@ -16,13 +16,21 @@ Environment overrides (optional):
   VLLM_PORT=8000
   VLLM_MAX_NUM_SEQS=32
 
-  TRAIN_LIMIT=256
+  TRAIN_LIMIT=2048
   TRAIN_STEPS=50
-  TRAIN_CONCURRENCY=4
+  TRAIN_CONCURRENCY=11
   TRAIN_BATCH_SIZE=1
   TRAIN_GROUP_SIZE=8
+  TRAIN_TEMPERATURE=1.0
   TRAIN_LOG_LEVEL=INFO
   TRAIN_LOGGER=print
+
+  EVAL_BEFORE_START=1
+  EVAL_EVERY=10
+  EVAL_LIMIT=100
+  EVAL_CONCURRENCY=32
+  EVAL_TEMPERATURE=0.0
+  EVAL_MAX_TOKENS=512
 
   UV_CACHE_DIR=/path/to/writable/cache
 EOF
@@ -48,13 +56,21 @@ VLLM_HOST="${VLLM_HOST:-127.0.0.1}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-32}"
 
-TRAIN_LIMIT="${TRAIN_LIMIT:-256}"
+TRAIN_LIMIT="${TRAIN_LIMIT:-2048}"
 TRAIN_STEPS="${TRAIN_STEPS:-50}"
-TRAIN_CONCURRENCY="${TRAIN_CONCURRENCY:-4}"
+TRAIN_CONCURRENCY="${TRAIN_CONCURRENCY:-11}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 TRAIN_GROUP_SIZE="${TRAIN_GROUP_SIZE:-8}"
+TRAIN_TEMPERATURE="${TRAIN_TEMPERATURE:-1.0}"
 TRAIN_LOG_LEVEL="${TRAIN_LOG_LEVEL:-INFO}"
 TRAIN_LOGGER="${TRAIN_LOGGER:-print}"
+
+EVAL_BEFORE_START="${EVAL_BEFORE_START:-1}"
+EVAL_EVERY="${EVAL_EVERY:-10}"
+EVAL_LIMIT="${EVAL_LIMIT:-100}"
+EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-32}"
+EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.0}"
+EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-512}"
 
 server_pid=""
 
@@ -90,6 +106,10 @@ stop_server() {
 
 run_train() {
   echo "[run_example] starting training on GPUs 1,2,3 ..."
+  extra_eval=()
+  if [[ "$EVAL_BEFORE_START" == "1" ]]; then
+    extra_eval+=(--eval-before-start)
+  fi
   CUDA_VISIBLE_DEVICES=1,2,3 uv run torchrun --nproc_per_node=3 \
     examples/fsdp2_training/train_gsm8k_fsdp2.py \
       --model "$MODEL" \
@@ -100,6 +120,13 @@ run_train() {
       --concurrency "$TRAIN_CONCURRENCY" \
       --batch-size "$TRAIN_BATCH_SIZE" \
       --group-size "$TRAIN_GROUP_SIZE" \
+      --train-temperature "$TRAIN_TEMPERATURE" \
+      --eval-every "$EVAL_EVERY" \
+      --eval-limit "$EVAL_LIMIT" \
+      --eval-concurrency "$EVAL_CONCURRENCY" \
+      --eval-temperature "$EVAL_TEMPERATURE" \
+      --eval-max-tokens "$EVAL_MAX_TOKENS" \
+      "${extra_eval[@]}" \
       --log-level "$TRAIN_LOG_LEVEL" \
       --logger "$TRAIN_LOGGER"
 }
@@ -118,4 +145,3 @@ case "$mode" in
     run_train
     ;;
 esac
-
