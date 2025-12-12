@@ -10,10 +10,11 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn, optim
 import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    FullStateDictConfig,
-    StateDictType,
+from torch.distributed import fsdp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    set_model_state_dict,
+    StateDictOptions,
 )
 
 logger = logging.getLogger(__name__)
@@ -153,10 +154,13 @@ class CheckpointManager:
         """
         Return a full, CPU-offloaded state dict suitable for HF saving.
         """
-        if isinstance(model, FSDP):
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
-                return model.state_dict()
+        if isinstance(model, fsdp.FSDPModule):
+            options = StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+                broadcast_from_rank0=True,
+            )
+            return get_model_state_dict(model=model, options=options)
 
         # Non-FSDP path
         return model.state_dict()
@@ -171,7 +175,7 @@ class CheckpointManager:
         Save in HuggingFace format when possible, otherwise fall back to a
         torch state_dict + minimal config stub.
         """
-        inner_model = model.module if isinstance(model, FSDP) else model
+        inner_model = getattr(model, "module", model)
         save_pretrained = getattr(inner_model, "save_pretrained", None)
 
         if callable(save_pretrained):
@@ -276,10 +280,15 @@ class CheckpointManager:
         """
         state_dict = self._read_state_dict(ckpt_dir)
 
-        if isinstance(model, FSDP):
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
-                model.load_state_dict(state_dict)
+        if isinstance(model, fsdp.FSDPModule):
+            set_model_state_dict(
+                model=model,
+                model_state_dict=state_dict,
+                options=StateDictOptions(
+                    full_state_dict=True,
+                    broadcast_from_rank0=True,
+                ),
+            )
         else:
             model.load_state_dict(state_dict)
 

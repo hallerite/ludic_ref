@@ -17,12 +17,17 @@ from ludic.context.full_dialog import FullDialog
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.inference.vllm_utils import start_vllm_server, wait_for_vllm_health
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
-from ludic.parsers import compose_parsers, cot_prefix_parser, xml_move_parser
+from ludic.parsers import Parser, compose_parsers, cot_prefix_parser, token_guard_parser, xml_move_parser
 from ludic.types import SamplingArgs
 from environments.tic_tac_toe import TicTacToeEnv
 from ludic.training.stats import Reducer, apply_reducers_to_records
 
-TICTACTOE_PARSER = compose_parsers(cot_prefix_parser, xml_move_parser)
+def build_tictactoe_parser(max_tokens: int) -> Parser:
+    return compose_parsers(
+        token_guard_parser(max_tokens),
+        cot_prefix_parser,
+        xml_move_parser,
+    )
 
 
 async def eval_episodes(
@@ -37,6 +42,7 @@ async def eval_episodes(
     max_steps: int,
     concurrency: int = 1,
 ) -> List[dict]:
+    parser = build_tictactoe_parser(max_tokens)
     reducers: Dict[str, Reducer] = {
         "win_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "win", normalize_by="rollouts"),
         "loss_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "loss", normalize_by="rollouts"),
@@ -84,7 +90,7 @@ async def eval_episodes(
                         client=client,
                         model=model,
                         ctx=FullDialog(),
-                        parser=TICTACTOE_PARSER,
+                        parser=parser,
                     ),
                     prompt=sys_prompt,
                 ).run(
