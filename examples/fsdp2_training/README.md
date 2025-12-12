@@ -31,7 +31,7 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
        --train-steps 50 \
        --concurrency 4 \
        --batch-size 1 \
-      --group-size 8 \
+       --group-size 8 \
        --log-level INFO \
        --logger print
    ```
@@ -43,6 +43,7 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
 
 ## Notes
 - Mixed precision: uses `fsdp.MixedPrecisionPolicy` with bf16 params / fp32 reductions.
+- Activation checkpointing: enabled by default in the script.
 - Gradient sync: uses `set_requires_gradient_sync(False/True)` for accumulation; no `no_sync`.
 - Weight publishing: only rank0 gathers a full state dict (DCP full_state_dict) and broadcasts to vLLM over the separate pynccl communicator.
 - Sample sharding: GSM8K samples are sharded per rank to avoid duplicates; adjust to your data loader if needed.

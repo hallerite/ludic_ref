@@ -323,6 +323,7 @@ def main() -> None:
         batch_source=batch_source,
         publisher=publisher,
         cfg=cfg,
+        enable_gradient_checkpointing=True,
         checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,
         reducers=reducers,
