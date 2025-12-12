@@ -194,7 +194,7 @@ def main() -> None:
     # Load on CPU then fully_shard to training devices
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": "cpu"},
         low_cpu_mem_usage=True,
     )
