@@ -47,6 +47,14 @@ class TrainerConfig:
 
     - pad_token_id:
           Used when padding sequences during SAW collation.
+
+    ==========================
+    Distributed
+    ==========================
+
+    - reduce_stats_across_ranks:
+          If True (and torch.distributed is initialized), Trainer will all-reduce
+          the per-rank stats dict before logging/returning it.
     """
 
     # ----- model / optimization -------------------
@@ -67,6 +75,7 @@ class TrainerConfig:
 
     # PipelineRL specific settings
     max_lag: Optional[int] = None  # Drop batches older than N steps
+    reduce_stats_across_ranks: bool = False
 
     # ----- collation ------------------------------
     pad_token_id: int = 0

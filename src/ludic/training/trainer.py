@@ -283,6 +283,39 @@ class Trainer:
             eps=self.cfg.eps,
         )
 
+    def _maybe_reduce_stats_across_ranks(
+        self,
+        stats: Dict[str, float],
+        *,
+        device: torch.device,
+    ) -> Dict[str, float]:
+        if not self.cfg.reduce_stats_across_ranks:
+            return stats
+        if not (dist.is_available() and dist.is_initialized()):
+            return stats
+
+        world_size = dist.get_world_size()
+        sum_keys = {
+            "num_samples",
+            "num_rollouts",
+            "total_completion_tokens",
+        }
+        reduced: Dict[str, float] = {}
+
+        for k, v in stats.items():
+            if not isinstance(v, (int, float)):
+                continue
+            t = torch.tensor(float(v), device=device, dtype=torch.float32)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            if k in sum_keys:
+                reduced[k] = float(t.item())
+            else:
+                reduced[k] = float(t.item()) / float(world_size)
+
+        # Preserve the local step counter
+        reduced["train_step"] = float(self._train_step_idx)
+        return reduced
+
     # ------------------------------------------------------------------
     # Memory utilities (GPU-only)
     # ------------------------------------------------------------------
@@ -526,6 +559,8 @@ class Trainer:
         # ---- 6) Enrich stats -------------------------------------------
         final_stats = aggregate_stats(all_micro_stats, all_saw_batches, reducers=self.reducers)
         final_stats["train_step"] = float(self._train_step_idx)
+
+        final_stats = self._maybe_reduce_stats_across_ranks(final_stats, device=device)
 
         # ---- 7) Optional Checkpoint ------------------------------------
         if self._checkpointer is not None:

@@ -102,6 +102,14 @@ def configure_logging(*, rank: int, level: str) -> None:
     for noisy in ("urllib3", "aiohttp", "httpx", "openai", "datasets", "transformers"):
         logging.getLogger(noisy).setLevel(max(numeric, logging.WARNING))
 
+def silence_nonzero_ranks(*, rank: int) -> None:
+    if rank == 0:
+        return
+    logging.getLogger().setLevel(logging.ERROR)
+    for noisy in ("urllib3", "aiohttp", "httpx", "openai", "datasets", "transformers"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
+    sys.stdout = open(os.devnull, "w")  # noqa: SIM115
+
 
 def init_dist(*, local_rank: int) -> int:
     if dist.is_initialized():
@@ -197,12 +205,20 @@ def main() -> None:
     parser.add_argument("--eval-max-tokens", type=int, default=512)
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--logger", choices=["rich", "print", "none"], default="rich")
+    parser.add_argument(
+        "--rank0-only-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Silence stdout/logging on non-rank0 processes (recommended).",
+    )
     args = parser.parse_args()
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     rank = init_dist(local_rank=env_local_rank)
     world_size = dist.get_world_size()
     configure_logging(rank=rank, level=args.log_level)
+    if args.rank0_only_output:
+        silence_nonzero_ranks(rank=rank)
 
     device = torch.device(f"cuda:{env_local_rank}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
@@ -315,6 +331,7 @@ def main() -> None:
         grad_accum_steps=2,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
+        reduce_stats_across_ranks=True,
     )
     checkpoint_cfg = CheckpointConfig(
         output_dir=args.checkpoint_dir,

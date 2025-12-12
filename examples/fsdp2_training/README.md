@@ -39,7 +39,8 @@ bash examples/fsdp2_training/run_example.sh
      --eval-before-start --eval-every 10 --eval-limit 100 \
      --eval-concurrency 32 --eval-temperature 0.0 \
      --log-level INFO \
-     --logger print
+     --logger print \
+     --rank0-only-output
    ```
 
 3. Checkpoints and logs:

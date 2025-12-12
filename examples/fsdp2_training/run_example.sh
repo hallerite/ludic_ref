@@ -24,6 +24,7 @@ Environment overrides (optional):
   TRAIN_TEMPERATURE=1.0
   TRAIN_LOG_LEVEL=INFO
   TRAIN_LOGGER=print
+  RANK0_ONLY_OUTPUT=1
 
   EVAL_BEFORE_START=1
   EVAL_EVERY=10
@@ -64,6 +65,7 @@ TRAIN_GROUP_SIZE="${TRAIN_GROUP_SIZE:-8}"
 TRAIN_TEMPERATURE="${TRAIN_TEMPERATURE:-1.0}"
 TRAIN_LOG_LEVEL="${TRAIN_LOG_LEVEL:-INFO}"
 TRAIN_LOGGER="${TRAIN_LOGGER:-print}"
+RANK0_ONLY_OUTPUT="${RANK0_ONLY_OUTPUT:-1}"
 
 EVAL_BEFORE_START="${EVAL_BEFORE_START:-1}"
 EVAL_EVERY="${EVAL_EVERY:-10}"
@@ -128,7 +130,8 @@ run_train() {
       --eval-max-tokens "$EVAL_MAX_TOKENS" \
       "${extra_eval[@]}" \
       --log-level "$TRAIN_LOG_LEVEL" \
-      --logger "$TRAIN_LOGGER"
+      --logger "$TRAIN_LOGGER" \
+      --rank0-only-output="$RANK0_ONLY_OUTPUT"
 }
 
 case "$mode" in
