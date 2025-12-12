@@ -190,9 +190,7 @@ def main() -> None:
     parser.add_argument("--train-steps", type=int, default=50)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=1)
-    # With 3 training ranks, 11 -> ~33 total in-flight rollouts hitting vLLM,
-    # which tends to saturate a --max-num-seqs 32 server without overdoing it.
-    parser.add_argument("--concurrency", type=int, default=11)
+    parser.add_argument("--concurrency", type=int, default=12)
     parser.add_argument("--train-temperature", type=float, default=1.0)
     parser.add_argument("--system-prompt", type=str, default="")
     parser.add_argument("--rollout-log", type=str, default="fsdp2_gsm8k_rollouts.jsonl")
@@ -240,8 +238,9 @@ def main() -> None:
     if not train_samples:
         raise SystemExit(f"Rank {rank}: no samples after sharding.")
 
+    do_eval = bool(args.eval_limit and args.eval_limit > 0)
     eval_samples: List[Dict[str, Any]] = []
-    if rank == 0 and args.eval_limit and args.eval_limit > 0:
+    if rank == 0 and do_eval:
         eval_samples = load_gsm8k("test", args.eval_limit)
 
     samples_q: queue.Queue = queue.Queue()
@@ -398,7 +397,7 @@ def main() -> None:
     )
 
     async def train_loop():
-        if args.eval_before_start and eval_samples:
+        if args.eval_before_start and do_eval:
             if rank == 0:
                 acc = await run_eval(
                     samples=eval_samples,
@@ -433,7 +432,7 @@ def main() -> None:
                     flush=True,
                 )
 
-            if args.eval_every and args.eval_every > 0 and eval_samples:
+            if args.eval_every and args.eval_every > 0 and do_eval:
                 step = int(stats["train_step"])
                 if step % args.eval_every == 0:
                     if dist.is_initialized():
