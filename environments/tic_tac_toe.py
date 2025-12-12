@@ -126,8 +126,10 @@ class TicTacToeEnv(SingleAgentEnv):
 
         Reward:
           +1.0  agent wins
-          -1.0  agent loses
-           0.0  draw or non-terminal step
+          +0.5  draw
+           0.0  agent loses
+          -1.0  illegal move
+           0.0  non-terminal step
         """
         if self._done:
             raise RuntimeError(
@@ -253,10 +255,11 @@ class TicTacToeEnv(SingleAgentEnv):
 
     def _result_to_reward(self, result: _GameResult) -> float:
         if result.draw:
-            return 0.0
+            return 0.5
         if result.winner == self.agent_mark:
             return 1.0
-        return -1.0
+        # Loss (opponent wins)
+        return 0.0
 
     def _result_label(self, result: _GameResult) -> str:
         if result.draw:
