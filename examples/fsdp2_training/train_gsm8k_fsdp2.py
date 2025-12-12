@@ -335,7 +335,7 @@ def main() -> None:
     )
     checkpoint_cfg = CheckpointConfig(
         output_dir=args.checkpoint_dir,
-        every_n_steps=10,
+        every_n_steps=25,
         max_to_keep=2,
         save_optimizer=True,
     )
