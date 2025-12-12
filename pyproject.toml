@@ -3,13 +3,13 @@ name = "ludic"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "openai>=2.7.1",
     "peft>=0.18.0",
     "rich>=14.2.0",
     "torch>=2.8.0",
-    "vllm>=0.11.0",
+    "vllm>=0.10.0",
 ]
 
 [build-system]
@@ -34,3 +34,9 @@ markers = [
     "gpu: marks tests as needing a GPU"
 ]
 testpaths = ["tests"]
+
+[tool.uv.extra-build-dependencies]
+# This tells uv: "When building flash-attn, let it see the torch we already installed"
+flash-attn = [
+    { requirement = "torch", match-runtime = true }
+]

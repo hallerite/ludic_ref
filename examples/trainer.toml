@@ -1,0 +1,30 @@
+# trainer.toml
+output_dir = "/root/ludic/runs/tictactoe_lora_run"
+
+[model]
+name = "Qwen/Qwen2.5-7B-Instruct"
+
+[model.experimental.lora]
+rank = 8
+alpha = 16
+dropout = 0.05
+target_modules = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj"
+]
+
+[optim]
+lr = 1e-5
+weight_decay = 0.01
+
+[ckpt]
+interval = 10
+weights.save_adapter_separately = false
+
+[weight_broadcast]
+type = "filesystem"
+adapter_only = false
+
+[wandb]
+project = "ludic-tictactoe"
+name = "qwen-7b-lora-run-1"

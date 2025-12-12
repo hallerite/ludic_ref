@@ -1,0 +1,25 @@
+# inference.toml
+
+# --- Top-level Backend Settings ---
+gpu_memory_utilization = 0.4
+
+# --- Server Configuration ---
+[server]
+port = 8000
+# host = "0.0.0.0"  # uncomment if you want external access
+
+# --- Model Configuration ---
+[model]
+name = "Qwen/Qwen2.5-7B-Instruct"
+max_model_len = 2048
+enforce_eager = true
+# trust_remote_code = true  # if the HF model requires it
+
+# --- Parallelism ---
+[parallel]
+tp = 1
+dp = 1
+
+# --- Weight Sync / Broadcast ---
+[weight_broadcast]
+type = "filesystem"
