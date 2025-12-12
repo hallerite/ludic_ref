@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import queue
+import sys
 from typing import Any, Dict, List
 
 import torch
@@ -50,10 +52,34 @@ class _NoopPublisher:
         return
 
 
-def init_dist() -> int:
+def configure_logging(*, rank: int, level: str) -> None:
+    numeric = getattr(logging, level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=numeric,
+        format=f"%(asctime)s [rank{rank}] %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    # Keep very chatty libraries quieter by default.
+    for noisy in ("urllib3", "aiohttp", "httpx", "openai", "datasets", "transformers"):
+        logging.getLogger(noisy).setLevel(max(numeric, logging.WARNING))
+
+
+def init_dist(*, local_rank: int) -> int:
     if dist.is_initialized():
         return dist.get_rank()
-    dist.init_process_group(backend="nccl")
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
+    else:
+        dist.init_process_group(
+            backend="gloo",
+            init_method="env://",
+        )
     return dist.get_rank()
 
 
@@ -122,12 +148,16 @@ def main() -> None:
     parser.add_argument("--system-prompt", type=str, default="")
     parser.add_argument("--rollout-log", type=str, default="fsdp2_gsm8k_rollouts.jsonl")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_gsm8k_fsdp2")
+    parser.add_argument("--log-level", type=str, default="INFO")
+    parser.add_argument("--logger", choices=["rich", "print", "none"], default="rich")
     args = parser.parse_args()
 
-    rank = init_dist()
+    env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = init_dist(local_rank=env_local_rank)
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    configure_logging(rank=rank, level=args.log_level)
+
+    device = torch.device(f"cuda:{env_local_rank}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
 
     # Avoid multiple ranks writing to the same file.
@@ -137,6 +167,9 @@ def main() -> None:
         os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
         os.makedirs(args.checkpoint_dir, exist_ok=True)
     dist.barrier()
+    logging.getLogger(__name__).info(
+        "Initialized distributed training (world_size=%s, device=%s).", world_size, device
+    )
 
     # Data
     all_train_samples = load_gsm8k(args.split, args.limit)
@@ -252,19 +285,37 @@ def main() -> None:
     }
     train_logger = None
     if rank == 0:
-        train_logger = RichLiveLogger(
-            keys=[
-                "loss",
-                "avg_total_reward",
-                "correct_rate",
-                "parse_err_rate",
-                "num_rollouts",
-                "num_samples",
-            ],
-            spark_key="avg_total_reward",
-            history=100,
-            precision=4,
-        )
+        if args.logger == "none":
+            train_logger = None
+        elif args.logger == "print" or not sys.stdout.isatty():
+            from ludic.training.loggers import PrintLogger
+
+            train_logger = PrintLogger(
+                prefix="[trainer]",
+                keys=[
+                    "loss",
+                    "avg_total_reward",
+                    "correct_rate",
+                    "parse_err_rate",
+                    "num_rollouts",
+                    "num_samples",
+                ],
+                precision=4,
+            )
+        else:
+            train_logger = RichLiveLogger(
+                keys=[
+                    "loss",
+                    "avg_total_reward",
+                    "correct_rate",
+                    "parse_err_rate",
+                    "num_rollouts",
+                    "num_samples",
+                ],
+                spark_key="avg_total_reward",
+                history=100,
+                precision=4,
+            )
 
     trainer = Trainer(
         model=model,
@@ -284,7 +335,10 @@ def main() -> None:
             stats = await trainer.train_step()
             if rank == 0:
                 step = int(stats["train_step"])
-                print(f"[rank0 step {step}] loss={stats.get('loss'):.4f} reward={stats.get('avg_total_reward'):.4f}")
+                print(
+                    f"[rank0 step {step}] loss={stats.get('loss'):.4f} reward={stats.get('avg_total_reward'):.4f}",
+                    flush=True,
+                )
 
     asyncio.run(train_loop())
 

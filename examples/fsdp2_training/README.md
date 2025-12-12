@@ -22,13 +22,18 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
 2. Launch training on GPUs 1–3:
    ```bash
    # Pin training to GPUs 1,2,3 so GPU0 stays free for vLLM
-   CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 \
+   CUDA_VISIBLE_DEVICES=1,2,3 PYTHONPATH=. PYTHONUNBUFFERED=1 uv run torchrun --nproc_per_node=3 \
      examples/fsdp2_training/train_gsm8k_fsdp2.py \
        --model Qwen/Qwen2.5-7B-Instruct \
        --vllm-host 127.0.0.1 \
        --vllm-port 8000 \
        --limit 256 \
-       --train-steps 50
+       --train-steps 50 \
+       --concurrency 4 \
+       --batch-size 1 \
+      --group-size 8 \
+       --log-level INFO \
+       --logger print
    ```
 
 3. Checkpoints and logs:
