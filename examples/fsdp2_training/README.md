@@ -11,6 +11,11 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
 - Training runs under `torchrun` with NCCL; vLLM weight pushes use a separate NCCL communicator (`pynccl`) owned by the client. They do not interfere.
 
 ## Quickstart (template)
+You can run everything with the helper script:
+```bash
+bash examples/fsdp2_training/run_example.sh
+```
+
 1. Start vLLM on GPU0 (example using the bundled server):
    ```bash
    CUDA_VISIBLE_DEVICES=0 uv run python -m ludic.inference.vllm_server \
