@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Mapping
@@ -306,6 +305,11 @@ class Trainer:
             if not isinstance(v, (int, float)):
                 continue
             t = torch.tensor(float(v), device=device, dtype=torch.float32)
+            if k.startswith("gpu_"):
+                dist.all_reduce(t, op=dist.ReduceOp.MAX)
+                reduced[k] = float(t.item())
+                continue
+
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             if k in sum_keys:
                 reduced[k] = float(t.item())
@@ -421,9 +425,7 @@ class Trainer:
             Aggregated stats dict from all micro-batches.
         """
         device = torch.device(self.cfg.model_device)
-        grad_accum_steps = getattr(self.cfg, "grad_accum_steps", 1)
-        if grad_accum_steps < 1:
-            grad_accum_steps = 1
+        grad_accum_steps = max(1, int(self.cfg.grad_accum_steps))
 
         all_micro_stats: List[Dict[str, float]] = []
         all_saw_batches: List[SAWBatch] = []
@@ -443,7 +445,7 @@ class Trainer:
                 saw_batch: SAWBatch = await self._batch_source.next_batch()
                 
                 # If configured, filter out items that exceed max_lag.
-                if getattr(self.cfg, "max_lag", None) is not None:
+                if self.cfg.max_lag is not None:
                     current_time = self._train_step_idx
                     limit = self.cfg.max_lag
                     
@@ -466,11 +468,12 @@ class Trainer:
 
             all_saw_batches.append(saw_batch)
 
-            # Debug: Check batch size before collation to diagnose OOM or filtering impact
             item_count = len(saw_batch.items)
-            logger.info(
-                f"[Micro-step {micro_step_idx+1}/{grad_accum_steps}] "
-                f"Processing {item_count} SAWItems."
+            logger.debug(
+                "[Micro-step %s/%s] Processing %s SAWItems.",
+                micro_step_idx + 1,
+                grad_accum_steps,
+                item_count,
             )
 
             # ---- 1b) Collate into tensors ------------------------------
@@ -480,11 +483,12 @@ class Trainer:
                 device=device,
             )
 
-            # Debug: Check tensor shape [Batch, Time]
             input_shape = batch_tensors["input_ids"].shape
-            logger.info(
-                f"    -> Collated Tensor Shape: {input_shape} "
-                f"(Batch={input_shape[0]}, SeqLen={input_shape[1]})"
+            logger.debug(
+                "    -> Collated Tensor Shape: %s (Batch=%s, SeqLen=%s)",
+                input_shape,
+                input_shape[0],
+                input_shape[1],
             )
 
             # ---- 1c) FSDP2 gradient sync control ----------------------

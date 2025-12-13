@@ -54,6 +54,10 @@ def aggregate_stats(
     """
     Aggregate micro-batch stats with batch-level metadata and optional reducers.
 
+    By default, micro-batch stats are averaged across micro-batches, except
+    keys prefixed with ``gpu_`` which are reduced using ``max`` (since they
+    typically represent peaks).
+
     Core outputs (always present):
         - num_samples: total SAWItems across batches
         - num_rollouts: total agent trajectories across batches
@@ -65,16 +69,33 @@ def aggregate_stats(
         return {}
 
     # 1) Standard loss/grad stats
-    agg_stats: Dict[str, float] = {k: 0.0 for k in micro_stats_list[0].keys()}
-    num_micro_batches = len(micro_stats_list)
+    all_keys = {k for ms in micro_stats_list for k in ms.keys()}
+    max_keys = {k for k in all_keys if k.startswith("gpu_")}
+
+    agg_stats: Dict[str, float] = {}
+    sum_counts: Dict[str, int] = {}
+    for k in all_keys:
+        if k in max_keys:
+            agg_stats[k] = float("-inf")
+        else:
+            agg_stats[k] = 0.0
+            sum_counts[k] = 0
 
     for micro_stats in micro_stats_list:
         for k, v in micro_stats.items():
-            if k in agg_stats:
+            if k in max_keys:
+                agg_stats[k] = max(agg_stats[k], v)
+            else:
                 agg_stats[k] += v
+                sum_counts[k] += 1
 
-    for k in agg_stats:
-        agg_stats[k] /= num_micro_batches
+    for k in list(agg_stats.keys()):
+        if k in max_keys:
+            if agg_stats[k] == float("-inf"):
+                del agg_stats[k]
+            continue
+        denom = sum_counts.get(k, 0)
+        agg_stats[k] = agg_stats[k] / float(denom) if denom > 0 else 0.0
 
     # 2) Batch metadata stats
     total_samples = 0.0
