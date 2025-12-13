@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import queue
 from typing import List, Dict, Any
 
 import torch
@@ -157,7 +156,7 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
     )
     # Apply a lightweight LoRA adapter to train only a small subset of params.

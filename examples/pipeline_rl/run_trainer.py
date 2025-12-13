@@ -67,7 +67,7 @@ def main():
     # 2. Load Heavy Model & LoRA
     print(f"📥 Loading Model: {MODEL_NAME}...")
     base_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.bfloat16, device_map="cuda:0"
+        MODEL_NAME, dtype=torch.bfloat16, device_map="cuda:0"
     )
     
     peft_config = LoraConfig(
