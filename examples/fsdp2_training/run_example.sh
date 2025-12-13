@@ -31,7 +31,9 @@ Environment overrides (optional):
   EVAL_LIMIT=100
   EVAL_CONCURRENCY=32
   EVAL_TEMPERATURE=0.0
-  EVAL_MAX_TOKENS=1024
+  MAX_TOKENS=1024
+  ROLLOUT_LOG=fsdp2_math_rollouts.jsonl
+  CHECKPOINT_DIR=checkpoints_math_fsdp2
 
   UV_CACHE_DIR=/path/to/writable/cache
 EOF
@@ -72,7 +74,9 @@ EVAL_EVERY="${EVAL_EVERY:-10}"
 EVAL_LIMIT="${EVAL_LIMIT:-100}"
 EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-32}"
 EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.0}"
-EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-1024}"
+MAX_TOKENS="${MAX_TOKENS:-1024}"
+ROLLOUT_LOG="${ROLLOUT_LOG:-fsdp2_math_rollouts.jsonl}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints_math_fsdp2}"
 
 server_pid=""
 
@@ -118,6 +122,8 @@ run_train() {
       --model "$MODEL" \
       --vllm-host "$VLLM_HOST" \
       --vllm-port "$VLLM_PORT" \
+      --rollout-log "$ROLLOUT_LOG" \
+      --checkpoint-dir "$CHECKPOINT_DIR" \
       --limit "$TRAIN_LIMIT" \
       --train-steps "$TRAIN_STEPS" \
       --concurrency "$TRAIN_CONCURRENCY" \
@@ -128,7 +134,7 @@ run_train() {
       --eval-limit "$EVAL_LIMIT" \
       --eval-concurrency "$EVAL_CONCURRENCY" \
       --eval-temperature "$EVAL_TEMPERATURE" \
-      --eval-max-tokens "$EVAL_MAX_TOKENS" \
+      --max-tokens "$MAX_TOKENS" \
       "${extra_eval[@]}" \
       --log-level "$TRAIN_LOG_LEVEL" \
       --logger "$TRAIN_LOGGER" \

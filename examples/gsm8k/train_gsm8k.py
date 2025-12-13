@@ -174,7 +174,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
     model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     # Shared client for inference
@@ -305,14 +305,14 @@ def main():
             train_step = int(stats["train_step"])
             if args.eval_every > 0 and train_step % args.eval_every == 0 and eval_samples:
                 acc = await run_eval(
-                samples=eval_samples,
-                client=client,
-                model=args.model,
-                system_prompt=args.system_prompt,
-                concurrency=args.eval_concurrency,
-                max_tokens=512,
-                temperature=args.eval_temperature,
-            )
+                    samples=eval_samples,
+                    client=client,
+                    model=args.model,
+                    system_prompt=args.system_prompt,
+                    concurrency=args.eval_concurrency,
+                    max_tokens=512,
+                    temperature=args.eval_temperature,
+                )
                 print(f"[eval @ step {train_step}] accuracy={acc:.2f}% on {len(eval_samples)} samples")
 
     asyncio.run(train_loop())

@@ -6,27 +6,23 @@ from typing import Optional
 from ludic.envs.dataset_qa_env import DatasetQAEnv, Sample
 
 
-def gsm8k_answer_parser(text: str) -> str:
+def gsm8k_target_parser(text: str) -> str:
     """
     Normalize GSM8K-style ground-truth answers:
       - strip whitespace
-      - take text after '####' if present
-      - unbox \\boxed{...}
-      - drop commas and grab the last numeric/fraction token
+      - take text after '####' (required)
+      - drop commas and grab the last integer token
     """
     cleaned = text.strip()
-    if "####" in cleaned:
-        cleaned = cleaned.split("####")[-1].strip()
-
-    boxed = re.search(r"\\boxed\{([^}]*)\}", cleaned)
-    if boxed:
-        cleaned = boxed.group(1).strip()
+    if "####" not in cleaned:
+        raise ValueError("Expected GSM8K answer to contain '####'.")
+    cleaned = cleaned.split("####")[-1].strip()
 
     cleaned = cleaned.replace(",", "").strip()
-    numeric_tokens = re.findall(r"-?\d+(?:/\d+)?(?:\.\d+)?", cleaned)
-    if numeric_tokens:
-        return numeric_tokens[-1].strip()
-    return cleaned
+    int_tokens = re.findall(r"-?\d+", cleaned)
+    if not int_tokens:
+        raise ValueError("Could not find a final integer after '####'.")
+    return int_tokens[-1].strip()
 
 
 class GSM8KEnv(DatasetQAEnv):
@@ -48,7 +44,7 @@ class GSM8KEnv(DatasetQAEnv):
             from math_verify import verify as mv  # type: ignore
         except Exception as e:
             raise SystemExit(
-                "GSM8KEnv requires 'hf-math-verify' for grading. "
+                "GSM8KEnv requires 'math-verify' (import name: math_verify) for grading. "
                 "Install with: uv pip install math-verify"
             ) from e
 
@@ -60,6 +56,6 @@ class GSM8KEnv(DatasetQAEnv):
             prompt_key="question",
             answer_key="answer",
             system_prompt=system_prompt,
-            target_parser=gsm8k_answer_parser,
+            target_parser=gsm8k_target_parser,
             verifier=_verifier,
         )

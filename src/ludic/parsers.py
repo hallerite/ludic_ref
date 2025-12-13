@@ -141,6 +141,44 @@ def xml_move_parser(
 # Strict \boxed{...} answer parser
 # ---------------------------------------------------------------------
 
+def extract_last_boxed_content(raw: str) -> Optional[str]:
+    """
+    Extract the content of the last LaTeX \\boxed{...} occurrence.
+
+    Supports nested braces inside the boxed content (e.g. \\boxed{\\frac{1}{2}}).
+    Returns None if no well-formed \\boxed{...} is found.
+    """
+    matches = list(re.finditer(r"\\boxed\s*\{", raw))
+    if not matches:
+        return None
+
+    def _parse_braced(start_brace_idx: int) -> Optional[str]:
+        if start_brace_idx >= len(raw) or raw[start_brace_idx] != "{":
+            return None
+
+        depth = 0
+        i = start_brace_idx
+        while i < len(raw):
+            ch = raw[i]
+            prev = raw[i - 1] if i > 0 else ""
+
+            if ch == "{" and prev != "\\":
+                depth += 1
+            elif ch == "}" and prev != "\\":
+                depth -= 1
+                if depth == 0:
+                    return raw[start_brace_idx + 1 : i]
+            i += 1
+        return None
+
+    # Prefer the last occurrence (the model may include intermediate boxes).
+    for m in reversed(matches):
+        inner = _parse_braced(m.end() - 1)
+        if inner is not None:
+            return inner
+    return None
+
+
 def boxed_parser(
     raw: str,
     *,
@@ -155,11 +193,11 @@ def boxed_parser(
         args or functools.partial for custom parser instances.
     """
     try:
-        m = re.search(r"\\boxed\{([^}]*)\}", raw, flags=re.DOTALL)
-        if not m:
+        inner = extract_last_boxed_content(raw)
+        if inner is None:
             raise ValueError("Expected \\boxed{...} with the final answer.")
 
-        inner = m.group(1).strip()
+        inner = inner.strip()
         if not inner:
             raise ValueError("Empty \\boxed{} content.")
 

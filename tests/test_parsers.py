@@ -5,6 +5,7 @@ import pytest
 from ludic.parsers import (
     ParseResult,
     cot_prefix_parser,
+    boxed_parser,
     xml_move_parser,
     compose_parsers,
 )
@@ -185,3 +186,31 @@ def test_compose_parsers_failure_reward_accumulates():
     assert r.action is None
     assert r.reward == pytest.approx(0.3 - 2.0)
     assert r.obs == "bad here"
+
+
+# ---------------------------------------------------------------------
+# boxed_parser tests
+# ---------------------------------------------------------------------
+
+def test_boxed_parser_extracts_simple_box():
+    r = boxed_parser("final: \\boxed{42}")
+    assert r.action == "42"
+    assert r.reward == pytest.approx(0.1)
+    assert r.obs is None
+
+
+def test_boxed_parser_supports_nested_braces():
+    r = boxed_parser("answer \\boxed{\\frac{1}{2}}")
+    assert r.action == "\\frac{1}{2}"
+    assert r.reward == pytest.approx(0.1)
+
+
+def test_boxed_parser_uses_last_box():
+    r = boxed_parser("intermediate \\boxed{0} final \\boxed{1}")
+    assert r.action == "1"
+
+
+def test_boxed_parser_fails_without_box():
+    r = boxed_parser("no box here")
+    assert r.action is None
+    assert r.reward < 0.0

@@ -32,7 +32,7 @@ from ludic.context.full_dialog import FullDialog
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
-from ludic.parsers import boxed_parser, compose_parsers, cot_prefix_parser
+from ludic.parsers import boxed_parser, compose_parsers, cot_prefix_parser, extract_last_boxed_content
 from ludic.training.algorithm import RLAlgorithm
 from ludic.training.batching.rollout_engine import RolloutEngine
 from ludic.training.batching.synced_batching import RolloutBatchSource
@@ -135,19 +135,66 @@ def shard_samples(samples: List[Dict[str, Any]], rank: int, world_size: int) -> 
     return [s for i, s in enumerate(samples) if i % world_size == rank]
 
 
-def load_math(split: str, limit: int | None) -> List[Dict[str, Any]]:
-    ds = load_dataset("hendrycks/competition_math", split=split)
+MATH_TRAIN_DATASET = "qwedsacf/competition_math"
+MATH_EVAL_DATASET = "HuggingFaceH4/MATH-500"
+
+
+def _load_dataset_split(dataset: str, split: str):
+    """
+    Load an HF dataset split without fallback.
+    """
+    try:
+        return load_dataset(dataset, split=split)
+    except Exception as e:
+        raise SystemExit(f"Could not load dataset={dataset!r} split={split!r}: {e}") from e
+
+
+def load_math_train(limit: int | None) -> List[Dict[str, Any]]:
+    ds = load_dataset(MATH_TRAIN_DATASET, split="train")
     samples: List[Dict[str, Any]] = []
     for idx, row in enumerate(ds):
+        problem = row.get("problem")
+        solution = row.get("solution")
+        if problem is None:
+            raise SystemExit(f"{MATH_TRAIN_DATASET} sample is missing 'problem' at index={idx}")
+        if solution is None:
+            raise SystemExit(f"{MATH_TRAIN_DATASET} sample is missing 'solution' at index={idx}")
         samples.append(
             {
-                "problem": row.get("problem") or row.get("question"),
-                "solution": row.get("solution") or row.get("answer"),
+                "problem": str(problem),
+                "solution": str(solution),
                 "id": row.get("id", idx),
                 "level": row.get("level"),
                 "type": row.get("type"),
             }
         )
+        if limit is not None and len(samples) >= limit:
+            break
+    return samples
+
+
+def load_math_eval(limit: int | None) -> List[Dict[str, Any]]:
+    ds = _load_dataset_split(MATH_EVAL_DATASET, split="test")
+    samples: List[Dict[str, Any]] = []
+    for idx, row in enumerate(ds):
+        solution = row.get("solution")
+        problem = row.get("problem")
+        sample: Dict[str, Any] = {
+            "problem": str(problem) if problem is not None else "",
+            "id": row.get("id", idx),
+            "level": row.get("level"),
+            "type": row.get("type"),
+        }
+        if problem is None:
+            raise SystemExit(f"{MATH_EVAL_DATASET} sample is missing 'problem' at index={idx}")
+        if solution is None:
+            raise SystemExit(f"{MATH_EVAL_DATASET} sample is missing 'solution' at index={idx}")
+        if extract_last_boxed_content(str(solution)) is None:
+            raise SystemExit(
+                f"{MATH_EVAL_DATASET} sample at index={idx} does not contain a final \\\\boxed{{...}} answer"
+            )
+        sample["solution"] = str(solution)
+        samples.append(sample)
         if limit is not None and len(samples) >= limit:
             break
     return samples
@@ -188,7 +235,6 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--vllm-host", default="127.0.0.1")
     parser.add_argument("--vllm-port", type=int, default=8000)
-    parser.add_argument("--split", default="train")
     parser.add_argument("--limit", type=int, default=2048)
     parser.add_argument("--train-steps", type=int, default=50)
     parser.add_argument("--group-size", type=int, default=8)
@@ -207,7 +253,12 @@ def main() -> None:
     parser.add_argument("--eval-limit", type=int, default=100, help="Number of test samples for eval (0 disables).")
     parser.add_argument("--eval-concurrency", type=int, default=32)
     parser.add_argument("--eval-temperature", type=float, default=0.0)
-    parser.add_argument("--eval-max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1024,
+        help="Max tokens per completion (train + eval).",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--logger", choices=["rich", "print", "none"], default="rich")
     parser.add_argument(
@@ -238,7 +289,7 @@ def main() -> None:
     )
 
     # Data
-    all_train_samples = load_math(args.split, args.limit)
+    all_train_samples = load_math_train(args.limit)
     train_samples = shard_samples(all_train_samples, rank, world_size)
     if not train_samples:
         raise SystemExit(f"Rank {rank}: no samples after sharding.")
@@ -246,7 +297,7 @@ def main() -> None:
     do_eval = bool(args.eval_limit and args.eval_limit > 0)
     eval_samples: List[Dict[str, Any]] = []
     if rank == 0 and do_eval:
-        eval_samples = load_math("test", args.eval_limit)
+        eval_samples = load_math_eval(args.eval_limit)
 
     samples_q: queue.Queue = queue.Queue()
     for idx, s in enumerate(train_samples):
@@ -316,7 +367,7 @@ def main() -> None:
     )
     sampling_args = {
         "temperature": args.train_temperature,
-        "max_tokens": args.eval_max_tokens,
+        "max_tokens": args.max_tokens,
         "extras": {"extra_body": {"return_token_ids": True}},
     }
     requests_fn = build_requests_fn(samples_q, args.batch_size, sampling_args, group_size=args.group_size)
@@ -409,7 +460,7 @@ def main() -> None:
                     model=args.model,
                     system_prompt=args.system_prompt,
                     concurrency=args.eval_concurrency,
-                    max_tokens=args.eval_max_tokens,
+                    max_tokens=args.max_tokens,
                     temperature=args.eval_temperature,
                     parser=action_parser,
                 )
@@ -448,7 +499,7 @@ def main() -> None:
                             model=args.model,
                             system_prompt=args.system_prompt,
                             concurrency=args.eval_concurrency,
-                            max_tokens=args.eval_max_tokens,
+                            max_tokens=args.max_tokens,
                             temperature=args.eval_temperature,
                             parser=action_parser,
                         )
@@ -466,4 +517,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

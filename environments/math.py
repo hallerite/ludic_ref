@@ -1,33 +1,23 @@
 from __future__ import annotations
 
-import re
 from typing import Optional
 
 from ludic.envs.dataset_qa_env import DatasetQAEnv, Sample
+from ludic.parsers import extract_last_boxed_content
 
 
-def math_answer_parser(text: str) -> str:
+def math_target_parser(text: str) -> str:
     """
     Normalize MATH-style ground-truth answers:
       - strip whitespace
-      - unbox \\boxed{...}
-      - take text after '####' if present
-      - drop commas and grab the last numeric/fraction token
+      - unbox the last \\boxed{...} (supports nested braces)
     """
     cleaned = text.strip()
 
-    boxed = re.search(r"\\boxed\{([^}]*)\}", cleaned)
-    if boxed:
-        cleaned = boxed.group(1).strip()
-
-    if "####" in cleaned:
-        cleaned = cleaned.split("####")[-1].strip()
-
-    cleaned = cleaned.replace(",", "").strip()
-    numeric_tokens = re.findall(r"-?\d+(?:/\d+)?(?:\.\d+)?", cleaned)
-    if numeric_tokens:
-        return numeric_tokens[-1].strip()
-    return cleaned
+    boxed = extract_last_boxed_content(cleaned)
+    if boxed is None:
+        raise ValueError("Expected a final answer in \\boxed{...}.")
+    return boxed.strip()
 
 
 class MATHEnv(DatasetQAEnv):
@@ -37,7 +27,7 @@ class MATHEnv(DatasetQAEnv):
 
     DEFAULT_SYSTEM_PROMPT = (
         "You are a careful math tutor. Think step by step. "
-        "Put your final numeric answer in \\boxed{...} or after ####."
+        "Put your final answer in \\boxed{...}."
     )
 
     def __init__(
@@ -50,7 +40,7 @@ class MATHEnv(DatasetQAEnv):
             from math_verify import verify as mv  # type: ignore
         except Exception as e:
             raise SystemExit(
-                "MATHEnv requires 'hf-math-verify' for grading. "
+                "MATHEnv requires 'math-verify' (import name: math_verify) for grading. "
                 "Install with: uv pip install math-verify"
             ) from e
 
@@ -62,6 +52,6 @@ class MATHEnv(DatasetQAEnv):
             prompt_key="problem" if "problem" in sample else "question",
             answer_key="solution" if "solution" in sample else "answer",
             system_prompt=system_prompt,
-            target_parser=math_answer_parser,
+            target_parser=math_target_parser,
             verifier=_verifier,
         )

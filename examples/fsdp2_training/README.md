@@ -5,6 +5,10 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
 ## Layout
 - `train_math_fsdp2.py`: MATH training with FSDP2 + strict `<think>...</think> \\boxed{...}` parsing.
 
+## Datasets
+- Training: `qwedsacf/competition_math` (train split only; uses `solution` and extracts the final `\\boxed{...}`).
+- Eval: `HuggingFaceH4/MATH-500` (uses `solution` and extracts the final `\\boxed{...}`; `answer` is available but not required).
+
 ## Assumptions
 - 4 GPUs total: GPU0 runs vLLM; GPUs 1–3 run training.
 - You start vLLM separately on GPU0 serving `Qwen/Qwen2.5-7B-Instruct`.
@@ -38,7 +42,27 @@ bash examples/fsdp2_training/run_example.sh
      --concurrency 11 --batch-size 1 --train-temperature 1.0 \
      --eval-before-start --eval-every 10 --eval-limit 100 \
      --eval-concurrency 32 --eval-temperature 0.0 \
-     --eval-max-tokens 1024 \
+     --max-tokens 1024 \
+     --log-level INFO \
+     --logger print \
+     --rank0-only-output
+   ```
+
+   If your node has a large local scratch disk (e.g. `/ephemeral`), point caches and checkpoints there:
+   ```bash
+   CUDA_VISIBLE_DEVICES=1,2,3 PYTHONPATH=. PYTHONUNBUFFERED=1 UV_CACHE_DIR=/ephemeral/uv_cache uv run torchrun --nproc_per_node=3 \
+     examples/fsdp2_training/train_math_fsdp2.py \
+     --model Qwen/Qwen2.5-7B-Instruct \
+     --vllm-host 127.0.0.1 \
+     --vllm-port 8000 \
+     --rollout-log /ephemeral/fsdp2_math_rollouts.jsonl \
+     --checkpoint-dir /ephemeral/checkpoints_math_fsdp2 \
+     --limit 2048 \
+     --train-steps 50 --group-size 8 \
+     --concurrency 11 --batch-size 1 --train-temperature 1.0 \
+     --eval-before-start --eval-every 10 --eval-limit 100 \
+     --eval-concurrency 32 --eval-temperature 0.0 \
+     --max-tokens 1024 \
      --log-level INFO \
      --logger print \
      --rank0-only-output
@@ -54,7 +78,7 @@ bash examples/fsdp2_training/run_example.sh
 - Activation checkpointing: enabled by default in the script.
 - Gradient sync: uses `set_requires_gradient_sync(False/True)` for accumulation; no `no_sync`.
 - Action parsing: the environment does not “re-parse” model outputs; the protocol’s parser must extract the final answer string used for grading.
-- Weight publishing: only rank0 gathers a full state dict (DCP full_state_dict) and broadcasts to vLLM over the separate pynccl communicator.
+- Weight publishing: only rank0 gathers a full state dict (DCP full_state_dict) and pushes weights to vLLM over the separate pynccl communicator.
 - Sample sharding: MATH samples are sharded per rank to avoid duplicates; adjust to your data loader if needed.
 
 Tune `--batch-size`, `--group-size`, and `--train-steps` based on hardware. The script is a scaffold; extend it for eval, better logging, and real hyperparameters.
