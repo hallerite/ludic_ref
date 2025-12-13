@@ -8,7 +8,7 @@ from ludic.envs.dataset_qa_env import DatasetQAEnv, Sample
 
 def gsm8k_answer_parser(text: str) -> str:
     """
-    Normalize GSM8K/MATH-style answers:
+    Normalize GSM8K-style ground-truth answers:
       - strip whitespace
       - take text after '####' if present
       - unbox \\boxed{...}
@@ -60,7 +60,6 @@ class GSM8KEnv(DatasetQAEnv):
             prompt_key="question",
             answer_key="answer",
             system_prompt=system_prompt,
-            answer_parser=gsm8k_answer_parser,
             target_parser=gsm8k_answer_parser,
-            comparator=_verifier,
+            verifier=_verifier,
         )

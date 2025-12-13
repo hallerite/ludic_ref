@@ -24,7 +24,8 @@ def test_dataset_env_runs_one_step_and_grades_correctly():
 
 
 def test_custom_parser_handles_gsm8k_and_math_formats():
-    def gsm_parser(text: str) -> str:
+    sample = {"question": "Box this", "answer": "\\boxed{7}"}
+    def gsm_target_parser(text: str) -> str:
         cleaned = text.strip()
         if "####" in cleaned:
             cleaned = cleaned.split("####")[-1].strip()
@@ -32,32 +33,14 @@ def test_custom_parser_handles_gsm8k_and_math_formats():
             cleaned = cleaned.replace("\\boxed{", "").replace("}", "")
         return cleaned.strip()
 
-    sample = {"question": "Box this", "answer": "\\boxed{7}"}
-    env = DatasetQAEnv(sample, answer_parser=gsm_parser, target_parser=gsm_parser)
+    env = DatasetQAEnv(sample, target_parser=gsm_target_parser)
     env.reset(seed=0)
 
-    outcome = env.step({"agent_0": "Reasoning... #### 7"})["agent_0"]
+    outcome = env.step({"agent_0": "7"})["agent_0"]
 
     assert outcome.info["parsed_answer"] == "7"
     assert outcome.info["target_answer"] == "7"
     assert outcome.info["correct"] is True
-
-
-def test_parse_error_marks_step_truncated():
-    sample = {"question": "any", "answer": "42"}
-    def _bad_parser(_: str) -> str:
-        raise ValueError("cannot parse")
-
-    env = DatasetQAEnv(sample, answer_parser=_bad_parser)
-    obs_info = env.reset(seed=0)
-    assert "agent_0" in obs_info
-
-    outcome = env.step({"agent_0": "???"})["agent_0"]
-
-    assert outcome.truncated is True
-    assert outcome.terminated is False
-    assert outcome.reward == pytest.approx(-1.0)
-    assert outcome.info["parse_error"] is True
 
 
 def test_sequential_sampling_without_shuffle():

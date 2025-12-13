@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import signal
 import subprocess
 from typing import List, Sequence, Dict
@@ -58,14 +59,39 @@ def load_gsm8k(split: str, limit: int | None) -> List[dict]:
     return samples
 
 
-def optional_cot_parser(raw: str) -> ParseResult:
+def gsm8k_final_answer_parser(raw: str) -> ParseResult:
     """
-    Try to strip a <think>...</think> prefix; otherwise keep raw text.
+    Extract a GSM8K final numeric answer for grading.
+
+    - Optionally strips a leading <think>...</think> prefix
+    - Requires the final answer in \\boxed{...} or after #### (or as a trailing number)
     """
-    result = cot_prefix_parser(raw)
-    if result.action is None:
-        return ParseResult(action=raw.strip(), reward=0.0, obs=None)
-    return result
+    cot = cot_prefix_parser(raw)
+    text = cot.action if cot.action is not None else raw.strip()
+
+    # Prefer explicit answer delimiters.
+    boxed = re.search(r"\\boxed\{([^}]*)\}", text, flags=re.DOTALL)
+    if boxed:
+        answer = boxed.group(1).strip()
+        if answer:
+            return ParseResult(action=answer, reward=cot.reward, obs=None)
+
+    if "####" in text:
+        answer = text.split("####")[-1].strip()
+        if answer:
+            return ParseResult(action=answer, reward=cot.reward, obs=None)
+
+    # Fallback: last numeric/fraction token.
+    cleaned = text.replace(",", "").strip()
+    numeric_tokens = re.findall(r"-?\\d+(?:/\\d+)?(?:\\.\\d+)?", cleaned)
+    if numeric_tokens:
+        return ParseResult(action=numeric_tokens[-1].strip(), reward=cot.reward, obs=None)
+
+    return ParseResult(
+        action=None,
+        reward=-1.0,
+        obs="Could not find a final answer (expected \\\\boxed{...} or '#### ...').",
+    )
 
 
 async def eval_dataset(
@@ -119,7 +145,7 @@ async def eval_dataset(
                         client=client,
                         model=model,
                         ctx=FullDialog(),
-                        parser=optional_cot_parser,
+                        parser=gsm8k_final_answer_parser,
                     )
                 ).run(
                     env=e,

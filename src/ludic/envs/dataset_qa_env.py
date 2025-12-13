@@ -8,7 +8,7 @@ from ludic.types import Info, Observation, StepOutcome
 
 Sample = Mapping[str, Any]
 ParserFn = Callable[[str], str]
-ComparatorFn = Callable[[str, str], bool]
+VerifierFn = Callable[[str, str], bool]
 PromptBuilder = Callable[[Sample], str]
 
 
@@ -16,7 +16,7 @@ def _identity_parser(text: str) -> str:
     return text.strip()
 
 
-def _default_comparator(a: str, b: str) -> bool:
+def _default_verifier(a: str, b: str) -> bool:
     """Simple case-insensitive comparison."""
     return a.strip().lower() == b.strip().lower()
 
@@ -29,8 +29,13 @@ class DatasetQAEnv(SingleAgentEnv):
     episode ends after a single agent answer is graded against the sample's
     ground truth.
 
-    Parsing/normalization is caller-provided via `answer_parser` and
-    `target_parser`; by default answers are only stripped.
+    Parsing/normalization is caller-provided via `target_parser`; by default
+    targets are only stripped.
+
+    The action passed to `env_step()` is treated as already-canonical. If you
+    want to enforce output formatting or extract a structured answer from raw
+    model output, do it in the interaction protocol / agent parser layer
+    (e.g. `ludic.parsers.boxed_parser`).
     """
 
     def __init__(
@@ -41,12 +46,10 @@ class DatasetQAEnv(SingleAgentEnv):
         answer_key: str = "answer",
         system_prompt: Optional[str] = None,
         prompt_builder: Optional[PromptBuilder] = None,
-        answer_parser: ParserFn = _identity_parser,
         target_parser: ParserFn = _identity_parser,
-        comparator: ComparatorFn = _default_comparator,
+        verifier: VerifierFn = _default_verifier,
         correct_reward: float = 1.0,
         incorrect_reward: float = 0.0,
-        parse_error_reward: float = -1.0,
     ) -> None:
         super().__init__()
         self._sample: Sample = sample
@@ -54,12 +57,10 @@ class DatasetQAEnv(SingleAgentEnv):
         self._answer_key = answer_key
         self._system_prompt = system_prompt
         self._prompt_builder = prompt_builder
-        self._answer_parser = answer_parser
         self._target_parser = target_parser
-        self._comparator = comparator
+        self._verifier = verifier
         self._correct_reward = correct_reward
         self._incorrect_reward = incorrect_reward
-        self._parse_error_reward = parse_error_reward
         self._current_prompt: Observation = ""
         self._current_answer: str = ""
         self._current_id: Optional[str] = None
@@ -112,28 +113,13 @@ class DatasetQAEnv(SingleAgentEnv):
             "raw_action": action,
         }
 
-        try:
-            parsed_answer = self._answer_parser(action)
-        except Exception as e:
-            self._done = True
-            info.update({"parse_error": True, "error": str(e)})
-            obs = f"Could not parse answer: {e}"
-            self._latest_obs = obs
-            return StepOutcome(
-                obs=obs,
-                reward=self._parse_error_reward,
-                truncated=True,
-                terminated=False,
-                info=info,
-            )
-
         parsed_target = self._target_parser(self._current_answer)
-        correct = self._comparator(parsed_answer, parsed_target)
+        correct = self._verifier(action, parsed_target)
         self._done = True
 
         info.update(
             {
-                "parsed_answer": parsed_answer,
+                "parsed_answer": action,
                 "target_answer": parsed_target,
                 "correct": correct,
             }

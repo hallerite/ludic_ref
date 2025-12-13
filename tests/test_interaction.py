@@ -122,8 +122,8 @@ async def test_run_episode_uses_action_parser_and_logs_parsed_action():
     # Env should terminate because parsed action == target "A1"
     assert step.terminated is True
 
-    # Parser reward: 0.0 ; Env reward: 1.0
-    assert rollout.total_reward == pytest.approx(1.0)
+    # Parser reward: +0.2 (two successful parsers); Env reward: 1.0
+    assert rollout.total_reward == pytest.approx(1.2)
 
 
 # ---------------------------------------------------------------------
