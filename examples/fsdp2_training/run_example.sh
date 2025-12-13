@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Run the FSDP2 GSM8K example on a 4-GPU node:
+Run the FSDP2 MATH example on a 4-GPU node:
   - GPU0: vLLM server
   - GPUs1-3: FSDP2 training (torchrun, 3 ranks)
 
@@ -31,7 +31,7 @@ Environment overrides (optional):
   EVAL_LIMIT=100
   EVAL_CONCURRENCY=32
   EVAL_TEMPERATURE=0.0
-  EVAL_MAX_TOKENS=512
+  EVAL_MAX_TOKENS=1024
 
   UV_CACHE_DIR=/path/to/writable/cache
 EOF
@@ -72,7 +72,7 @@ EVAL_EVERY="${EVAL_EVERY:-10}"
 EVAL_LIMIT="${EVAL_LIMIT:-100}"
 EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-32}"
 EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.0}"
-EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-512}"
+EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-1024}"
 
 server_pid=""
 
@@ -112,8 +112,9 @@ run_train() {
   if [[ "$EVAL_BEFORE_START" == "1" ]]; then
     extra_eval+=(--eval-before-start)
   fi
+  train_script="examples/fsdp2_training/train_math_fsdp2.py"
   CUDA_VISIBLE_DEVICES=1,2,3 uv run torchrun --nproc_per_node=3 \
-    examples/fsdp2_training/train_gsm8k_fsdp2.py \
+    "$train_script" \
       --model "$MODEL" \
       --vllm-host "$VLLM_HOST" \
       --vllm-port "$VLLM_PORT" \
