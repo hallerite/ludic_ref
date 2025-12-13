@@ -111,3 +111,44 @@ def test_checkpoint_manager_loads_model_and_optimizer(tmp_path: Path) -> None:
     assert restored_states and "test_buf" in restored_states[0]
     assert torch.equal(restored_states[0]["test_buf"], torch.tensor([42.0]))
     assert meta["step"] == 7
+
+
+def test_checkpoint_manager_loads_hf_sharded_bin_checkpoint(tmp_path: Path) -> None:
+    model = DummyHFModel()
+    state_dict = model.state_dict()
+    keys = list(state_dict.keys())
+    assert len(keys) >= 2
+
+    ckpt_dir = tmp_path / "sharded_ckpt"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    shard_1 = {keys[0]: state_dict[keys[0]]}
+    shard_2 = {keys[1]: state_dict[keys[1]]}
+
+    shard_1_name = "pytorch_model-00001-of-00002.bin"
+    shard_2_name = "pytorch_model-00002-of-00002.bin"
+    torch.save(shard_1, ckpt_dir / shard_1_name)
+    torch.save(shard_2, ckpt_dir / shard_2_name)
+
+    index = {
+        "metadata": {},
+        "weight_map": {
+            keys[0]: shard_1_name,
+            keys[1]: shard_2_name,
+        },
+    }
+    (ckpt_dir / "pytorch_model.bin.index.json").write_text(json.dumps(index))
+    (ckpt_dir / "trainer_state.json").write_text(json.dumps({"step": 123}))
+
+    manager = CheckpointManager(CheckpointConfig(output_dir=str(tmp_path / "unused"), every_n_steps=0))
+
+    model2 = DummyHFModel()
+    for p in model2.parameters():
+        p.data.zero_()
+
+    meta = manager.load(model2, path=str(ckpt_dir))
+    assert meta["step"] == 123
+
+    loaded = model2.state_dict()
+    assert torch.equal(loaded[keys[0]], state_dict[keys[0]])
+    assert torch.equal(loaded[keys[1]], state_dict[keys[1]])

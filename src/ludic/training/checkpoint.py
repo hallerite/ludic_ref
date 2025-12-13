@@ -173,7 +173,6 @@ class CheckpointManager:
             options = StateDictOptions(
                 full_state_dict=True,
                 cpu_offload=True,
-                broadcast_from_rank0=True,
             )
             return get_model_state_dict(model=model, options=options)
 
@@ -192,7 +191,6 @@ class CheckpointManager:
             options = StateDictOptions(
                 full_state_dict=True,
                 cpu_offload=True,
-                broadcast_from_rank0=True,
             )
             return get_optimizer_state_dict(
                 model=model,
@@ -214,13 +212,18 @@ class CheckpointManager:
         to other ranks, which shard it locally.
         """
         if isinstance(model, fsdp.FSDPModule):
+            broadcast = (
+                dist.is_available()
+                and dist.is_initialized()
+                and dist.get_world_size() > 1
+            )
             set_optimizer_state_dict(
                 model=model,
                 optimizers=optimizer,
                 optim_state_dict=optim_state or {},
                 options=StateDictOptions(
                     full_state_dict=True,
-                    broadcast_from_rank0=True,
+                    broadcast_from_rank0=broadcast,
                 ),
             )
             return
@@ -342,18 +345,27 @@ class CheckpointManager:
         """
         Load model weights from HF-style checkpoint directory.
         """
-        state_dict = self._read_state_dict(ckpt_dir)
-
         if isinstance(model, fsdp.FSDPModule):
+            is_distributed = (
+                dist.is_available()
+                and dist.is_initialized()
+                and dist.get_world_size() > 1
+            )
+            state_dict = (
+                self._read_state_dict(ckpt_dir)
+                if (not is_distributed or self._is_primary_rank())
+                else {}
+            )
             set_model_state_dict(
                 model=model,
                 model_state_dict=state_dict,
                 options=StateDictOptions(
                     full_state_dict=True,
-                    broadcast_from_rank0=True,
+                    broadcast_from_rank0=is_distributed,
                 ),
             )
         else:
+            state_dict = self._read_state_dict(ckpt_dir)
             model.load_state_dict(state_dict)
 
         meta_path = ckpt_dir / "trainer_state.json"
@@ -368,12 +380,79 @@ class CheckpointManager:
         """
         Read a state_dict saved by `_save_model`.
         """
-        candidates = [
-            ckpt_dir / "pytorch_model.bin",
-            ckpt_dir / "pytorch_model.pt",
-            ckpt_dir / "model.safetensors",
-        ]
-        for path in candidates:
+        safetensors_index = ckpt_dir / "model.safetensors.index.json"
+        if safetensors_index.exists():
+            return self._load_hf_sharded_state_dict(
+                ckpt_dir,
+                safetensors_index,
+                kind="safetensors",
+            )
+
+        torch_index = ckpt_dir / "pytorch_model.bin.index.json"
+        if torch_index.exists():
+            return self._load_hf_sharded_state_dict(
+                ckpt_dir,
+                torch_index,
+                kind="torch",
+            )
+
+        safetensors_path = ckpt_dir / "model.safetensors"
+        if safetensors_path.exists():
+            return self._load_safetensors(safetensors_path)
+
+        for path in (ckpt_dir / "pytorch_model.bin", ckpt_dir / "pytorch_model.pt"):
             if path.exists():
                 return torch.load(path, map_location="cpu")
+
         raise FileNotFoundError(f"No model state found in {ckpt_dir}")
+
+    def _load_hf_sharded_state_dict(
+        self,
+        ckpt_dir: Path,
+        index_path: Path,
+        *,
+        kind: str,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Load a HuggingFace sharded checkpoint described by an `*.index.json`.
+
+        Supports:
+          - `pytorch_model.bin.index.json` (torch.load shards)
+          - `model.safetensors.index.json` (safetensors shards)
+        """
+        payload = json.loads(index_path.read_text())
+        weight_map = payload.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Invalid HF index file (missing weight_map): {index_path}")
+
+        shard_files = sorted(set(weight_map.values()))
+        merged: Dict[str, torch.Tensor] = {}
+        for shard_name in shard_files:
+            shard_path = ckpt_dir / shard_name
+            if kind == "safetensors":
+                shard_sd = self._load_safetensors(shard_path)
+            elif kind == "torch":
+                shard_sd = torch.load(shard_path, map_location="cpu")
+            else:  # pragma: no cover
+                raise ValueError(f"Unknown sharded checkpoint kind={kind!r}")
+
+            if not isinstance(shard_sd, dict):
+                raise ValueError(f"Invalid shard contents (expected dict): {shard_path}")
+            merged.update(shard_sd)  # type: ignore[arg-type]
+
+        missing = [k for k in weight_map.keys() if k not in merged]
+        if missing:
+            raise KeyError(f"Missing {len(missing)} keys while loading {index_path}")
+
+        # Return only the weights listed in the index.
+        return {k: merged[k] for k in weight_map.keys()}
+
+    @staticmethod
+    def _load_safetensors(path: Path) -> Dict[str, torch.Tensor]:
+        try:
+            from safetensors.torch import load_file  # type: ignore
+        except Exception as e:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "Cannot load safetensors checkpoint. Install with: uv pip install safetensors"
+            ) from e
+        return load_file(str(path), device="cpu")
